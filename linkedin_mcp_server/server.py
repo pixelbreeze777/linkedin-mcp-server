@@ -17,8 +17,10 @@ from linkedin_mcp_server.bootstrap import (
     start_background_browser_setup_if_needed,
 )
 from linkedin_mcp_server.constants import TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.config import get_config
 from linkedin_mcp_server.drivers.browser import close_browser
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.http_auth import BearerTokenVerifier
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -48,10 +50,21 @@ async def browser_lifespan(app: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 def create_mcp_server() -> FastMCP:
     """Create and configure the MCP server with all LinkedIn tools."""
+    config = get_config()
+    auth = None
+    if (
+        config.server.transport == "streamable-http"
+        and config.server.mcp_auth_enabled
+        and config.server.mcp_bearer_token
+    ):
+        auth = BearerTokenVerifier(expected_token=config.server.mcp_bearer_token)
+        logger.info("MCP HTTP bearer auth is enabled")
+
     mcp = FastMCP(
         "linkedin_scraper",
         lifespan=browser_lifespan,
         mask_error_details=True,
+        auth=auth,
     )
     mcp.add_middleware(SequentialToolExecutionMiddleware())
 
@@ -74,7 +87,9 @@ def create_mcp_server() -> FastMCP:
             await close_browser()
             return {
                 "status": "success",
-                "message": "Successfully closed the browser session and cleaned up resources",
+                "message": (
+                    "Successfully closed the browser session and cleaned up resources"
+                ),
             }
         except Exception as e:
             raise_tool_error(e, "close_session")  # NoReturn

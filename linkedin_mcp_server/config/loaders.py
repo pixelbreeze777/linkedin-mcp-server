@@ -52,6 +52,8 @@ class EnvironmentKeys:
     VIEWPORT = "VIEWPORT"
     CHROME_PATH = "CHROME_PATH"
     USER_DATA_DIR = "USER_DATA_DIR"
+    MCP_AUTH_ENABLED = "MCP_AUTH_ENABLED"
+    MCP_BEARER_TOKEN = "MCP_BEARER_TOKEN"
 
 
 def is_interactive_environment() -> bool:
@@ -96,8 +98,25 @@ def load_from_env(config: AppConfig) -> AppConfig:
             config.server.transport = "streamable-http"
         else:
             raise ConfigurationError(
-                f"Invalid TRANSPORT: '{transport_env}'. Must be 'stdio' or 'streamable-http'."
+                "Invalid TRANSPORT: "
+                f"'{transport_env}'. Must be 'stdio' or 'streamable-http'."
             )
+
+    # HTTP MCP auth
+    if mcp_auth_enabled := os.environ.get(EnvironmentKeys.MCP_AUTH_ENABLED):
+        value = _normalize_env(mcp_auth_enabled)
+        if value in TRUTHY_VALUES:
+            config.server.mcp_auth_enabled = True
+        elif value in FALSY_VALUES:
+            config.server.mcp_auth_enabled = False
+        else:
+            raise ConfigurationError(
+                "Invalid MCP_AUTH_ENABLED: "
+                f"'{mcp_auth_enabled}'. Must be a boolean value."
+            )
+
+    if mcp_bearer_token := os.environ.get(EnvironmentKeys.MCP_BEARER_TOKEN):
+        config.server.mcp_bearer_token = mcp_bearer_token.strip()
 
     # Persistent browser profile directory
     if user_data_dir := os.environ.get(EnvironmentKeys.USER_DATA_DIR):

@@ -12,13 +12,27 @@ from linkedin_mcp_server.server import create_mcp_server
 
 
 class TestSequentialToolExecutionMiddleware:
-    async def test_create_mcp_server_registers_sequential_tool_middleware(self):
+    async def test_create_mcp_server_registers_sequential_tool_middleware(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server"])
         mcp = create_mcp_server()
 
         assert any(
             isinstance(middleware, SequentialToolExecutionMiddleware)
             for middleware in mcp.middleware
         )
+
+    async def test_create_mcp_server_enables_http_auth_when_configured(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server"])
+        monkeypatch.setenv("TRANSPORT", "streamable-http")
+        monkeypatch.setenv("MCP_AUTH_ENABLED", "true")
+        monkeypatch.setenv("MCP_BEARER_TOKEN", "test-token")
+        mcp = create_mcp_server()
+
+        assert mcp.auth is not None
 
     async def test_sequential_tool_middleware_serializes_parallel_tool_calls(self):
         mcp = FastMCP("test")

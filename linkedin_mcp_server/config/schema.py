@@ -70,6 +70,8 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     path: str = "/mcp"
+    mcp_auth_enabled: bool = False
+    mcp_bearer_token: str | None = None
 
 
 @dataclass
@@ -94,7 +96,12 @@ class AppConfig:
             raise ConfigurationError("HTTP transport requires a valid host")
         if not self.server.port:
             raise ConfigurationError("HTTP transport requires a valid port")
-        if self.server.host in ("0.0.0.0", "::"):
+        if self.server.mcp_auth_enabled and not self.server.mcp_bearer_token:
+            raise ConfigurationError(
+                "MCP_AUTH_ENABLED is true, but MCP_BEARER_TOKEN is empty. "
+                "Set MCP_BEARER_TOKEN to a strong random secret."
+            )
+        if self.server.host in ("0.0.0.0", "::") and not self.server.mcp_auth_enabled:
             logger.warning(
                 "HTTP transport is binding to %s which exposes the server to "
                 "all network interfaces. The MCP endpoint has no authentication "
