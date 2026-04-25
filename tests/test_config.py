@@ -32,6 +32,7 @@ class TestServerConfig:
         config = ServerConfig()
         assert config.transport == "stdio"
         assert config.port == 8000
+        assert config.mcp_auth_mode == "none"
         assert config.mcp_auth_enabled is False
         assert config.mcp_bearer_token is None
 
@@ -46,9 +47,16 @@ class TestAppConfig:
     def test_validate_streamable_http_auth_requires_token(self):
         config = AppConfig()
         config.server.transport = "streamable-http"
-        config.server.mcp_auth_enabled = True
+        config.server.mcp_auth_mode = "bearer"
         config.server.mcp_bearer_token = None
         with pytest.raises(ConfigurationError, match="MCP_BEARER_TOKEN"):
+            config.validate()
+
+    def test_validate_streamable_http_oauth_requires_settings(self):
+        config = AppConfig()
+        config.server.transport = "streamable-http"
+        config.server.mcp_auth_mode = "oauth"
+        with pytest.raises(ConfigurationError, match="MCP_OAUTH_BASE_URL"):
             config.validate()
 
 
@@ -224,6 +232,7 @@ class TestLoaders:
 
         config = load_from_env(AppConfig())
         assert config.server.mcp_auth_enabled is True
+        assert config.server.mcp_auth_mode == "bearer"
 
     def test_load_from_env_mcp_auth_enabled_false(self, monkeypatch):
         monkeypatch.setenv("MCP_AUTH_ENABLED", "off")
@@ -231,6 +240,7 @@ class TestLoaders:
 
         config = load_from_env(AppConfig())
         assert config.server.mcp_auth_enabled is False
+        assert config.server.mcp_auth_mode == "none"
 
     def test_load_from_env_invalid_mcp_auth_enabled(self, monkeypatch):
         monkeypatch.setenv("MCP_AUTH_ENABLED", "sometimes")
@@ -248,3 +258,32 @@ class TestLoaders:
 
         config = load_from_env(AppConfig())
         assert config.server.mcp_bearer_token == "super-secret"
+
+    def test_load_from_env_mcp_auth_mode_oauth(self, monkeypatch):
+        monkeypatch.setenv("MCP_AUTH_MODE", "oauth")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert config.server.mcp_auth_mode == "oauth"
+        assert config.server.mcp_auth_enabled is True
+
+    def test_load_from_env_invalid_mcp_auth_mode(self, monkeypatch):
+        monkeypatch.setenv("MCP_AUTH_MODE", "legacy")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        with pytest.raises(ConfigurationError, match="Invalid MCP_AUTH_MODE"):
+            load_from_env(AppConfig())
+
+    def test_load_from_env_mcp_oauth_settings(self, monkeypatch):
+        monkeypatch.setenv("MCP_AUTH_MODE", "oauth")
+        monkeypatch.setenv("MCP_OAUTH_BASE_URL", "https://example.com")
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("MCP_OAUTH_TOKEN_TTL_SECONDS", "1200")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert config.server.mcp_oauth_base_url == "https://example.com"
+        assert config.server.mcp_oauth_client_id == "cid"
+        assert config.server.mcp_oauth_client_secret == "secret"
+        assert config.server.mcp_oauth_token_ttl_seconds == 1200

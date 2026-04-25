@@ -34,6 +34,19 @@ class TestSequentialToolExecutionMiddleware:
 
         assert mcp.auth is not None
 
+    async def test_create_mcp_server_enables_oauth_auth_when_configured(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server"])
+        monkeypatch.setenv("TRANSPORT", "streamable-http")
+        monkeypatch.setenv("MCP_AUTH_MODE", "oauth")
+        monkeypatch.setenv("MCP_OAUTH_BASE_URL", "https://example.com")
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_SECRET", "secret")
+        mcp = create_mcp_server()
+
+        assert mcp.auth is not None
+
     async def test_sequential_tool_middleware_serializes_parallel_tool_calls(self):
         mcp = FastMCP("test")
         mcp.add_middleware(SequentialToolExecutionMiddleware())

@@ -9,6 +9,7 @@ import logging
 from typing import Any, AsyncIterator
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import MultiAuth
 from fastmcp.server.lifespan import lifespan
 
 from linkedin_mcp_server.bootstrap import (
@@ -21,6 +22,7 @@ from linkedin_mcp_server.config import get_config
 from linkedin_mcp_server.drivers.browser import close_browser
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.http_auth import BearerTokenVerifier
+from linkedin_mcp_server.oauth_auth import MinimalOAuthProvider
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -52,13 +54,40 @@ def create_mcp_server() -> FastMCP:
     """Create and configure the MCP server with all LinkedIn tools."""
     config = get_config()
     auth = None
-    if (
-        config.server.transport == "streamable-http"
-        and config.server.mcp_auth_enabled
-        and config.server.mcp_bearer_token
-    ):
-        auth = BearerTokenVerifier(expected_token=config.server.mcp_bearer_token)
-        logger.info("MCP HTTP bearer auth is enabled")
+    if config.server.transport == "streamable-http":
+        mode = config.server.mcp_auth_mode
+        if mode == "bearer" and config.server.mcp_bearer_token:
+            auth = BearerTokenVerifier(expected_token=config.server.mcp_bearer_token)
+            logger.info("MCP HTTP bearer auth is enabled")
+        elif (
+            mode == "oauth"
+            and config.server.mcp_oauth_base_url
+            and config.server.mcp_oauth_client_id
+            and config.server.mcp_oauth_client_secret
+        ):
+            auth = MinimalOAuthProvider(
+                base_url=config.server.mcp_oauth_base_url,
+                client_id=config.server.mcp_oauth_client_id,
+                client_secret=config.server.mcp_oauth_client_secret,
+                token_ttl_seconds=config.server.mcp_oauth_token_ttl_seconds,
+            )
+            logger.info("MCP HTTP OAuth auth is enabled")
+        elif (
+            mode == "multi"
+            and config.server.mcp_bearer_token
+            and config.server.mcp_oauth_base_url
+            and config.server.mcp_oauth_client_id
+            and config.server.mcp_oauth_client_secret
+        ):
+            oauth = MinimalOAuthProvider(
+                base_url=config.server.mcp_oauth_base_url,
+                client_id=config.server.mcp_oauth_client_id,
+                client_secret=config.server.mcp_oauth_client_secret,
+                token_ttl_seconds=config.server.mcp_oauth_token_ttl_seconds,
+            )
+            bearer = BearerTokenVerifier(expected_token=config.server.mcp_bearer_token)
+            auth = MultiAuth(server=oauth, verifiers=[bearer])
+            logger.info("MCP HTTP multi auth is enabled (oauth + bearer)")
 
     mcp = FastMCP(
         "linkedin_scraper",

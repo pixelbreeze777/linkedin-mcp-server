@@ -52,8 +52,13 @@ class EnvironmentKeys:
     VIEWPORT = "VIEWPORT"
     CHROME_PATH = "CHROME_PATH"
     USER_DATA_DIR = "USER_DATA_DIR"
+    MCP_AUTH_MODE = "MCP_AUTH_MODE"
     MCP_AUTH_ENABLED = "MCP_AUTH_ENABLED"
     MCP_BEARER_TOKEN = "MCP_BEARER_TOKEN"
+    MCP_OAUTH_BASE_URL = "MCP_OAUTH_BASE_URL"
+    MCP_OAUTH_CLIENT_ID = "MCP_OAUTH_CLIENT_ID"
+    MCP_OAUTH_CLIENT_SECRET = "MCP_OAUTH_CLIENT_SECRET"
+    MCP_OAUTH_TOKEN_TTL_SECONDS = "MCP_OAUTH_TOKEN_TTL_SECONDS"
 
 
 def is_interactive_environment() -> bool:
@@ -102,13 +107,33 @@ def load_from_env(config: AppConfig) -> AppConfig:
                 f"'{transport_env}'. Must be 'stdio' or 'streamable-http'."
             )
 
-    # HTTP MCP auth
+    # HTTP MCP auth mode
+    if mcp_auth_mode := os.environ.get(EnvironmentKeys.MCP_AUTH_MODE):
+        auth_mode = _normalize_env(mcp_auth_mode)
+        if auth_mode in {"none", "bearer", "oauth", "multi"}:
+            config.server.mcp_auth_mode = cast(
+                Literal["none", "bearer", "oauth", "multi"],
+                auth_mode,
+            )
+        else:
+            raise ConfigurationError(
+                "Invalid MCP_AUTH_MODE: "
+                f"'{mcp_auth_mode}'. Must be one of "
+                "'none', 'bearer', 'oauth', or 'multi'."
+            )
+
+    # Legacy flag for backwards compatibility.
+    # Applies only when MCP_AUTH_MODE is not explicitly set.
     if mcp_auth_enabled := os.environ.get(EnvironmentKeys.MCP_AUTH_ENABLED):
         value = _normalize_env(mcp_auth_enabled)
         if value in TRUTHY_VALUES:
             config.server.mcp_auth_enabled = True
+            if not os.environ.get(EnvironmentKeys.MCP_AUTH_MODE):
+                config.server.mcp_auth_mode = "bearer"
         elif value in FALSY_VALUES:
             config.server.mcp_auth_enabled = False
+            if not os.environ.get(EnvironmentKeys.MCP_AUTH_MODE):
+                config.server.mcp_auth_mode = "none"
         else:
             raise ConfigurationError(
                 "Invalid MCP_AUTH_ENABLED: "
@@ -117,6 +142,23 @@ def load_from_env(config: AppConfig) -> AppConfig:
 
     if mcp_bearer_token := os.environ.get(EnvironmentKeys.MCP_BEARER_TOKEN):
         config.server.mcp_bearer_token = mcp_bearer_token.strip()
+
+    if mcp_oauth_base_url := os.environ.get(EnvironmentKeys.MCP_OAUTH_BASE_URL):
+        config.server.mcp_oauth_base_url = mcp_oauth_base_url.strip()
+
+    if mcp_oauth_client_id := os.environ.get(EnvironmentKeys.MCP_OAUTH_CLIENT_ID):
+        config.server.mcp_oauth_client_id = mcp_oauth_client_id.strip()
+
+    if mcp_oauth_secret := os.environ.get(EnvironmentKeys.MCP_OAUTH_CLIENT_SECRET):
+        config.server.mcp_oauth_client_secret = mcp_oauth_secret.strip()
+
+    if ttl_env := os.environ.get(EnvironmentKeys.MCP_OAUTH_TOKEN_TTL_SECONDS):
+        try:
+            config.server.mcp_oauth_token_ttl_seconds = int(ttl_env)
+        except ValueError:
+            raise ConfigurationError(
+                f"Invalid MCP_OAUTH_TOKEN_TTL_SECONDS: '{ttl_env}'. Must be an integer."
+            )
 
     # Persistent browser profile directory
     if user_data_dir := os.environ.get(EnvironmentKeys.USER_DATA_DIR):
@@ -173,6 +215,8 @@ def load_from_env(config: AppConfig) -> AppConfig:
     # Custom Chrome/Chromium executable path
     if chrome_path_env := os.environ.get(EnvironmentKeys.CHROME_PATH):
         config.browser.chrome_path = chrome_path_env
+
+    config.server.mcp_auth_enabled = config.server.mcp_auth_mode != "none"
 
     return config
 

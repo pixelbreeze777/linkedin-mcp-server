@@ -70,8 +70,13 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     path: str = "/mcp"
+    mcp_auth_mode: Literal["none", "bearer", "oauth", "multi"] = "none"
     mcp_auth_enabled: bool = False
     mcp_bearer_token: str | None = None
+    mcp_oauth_base_url: str | None = None
+    mcp_oauth_client_id: str | None = None
+    mcp_oauth_client_secret: str | None = None
+    mcp_oauth_token_ttl_seconds: int = 3600
 
 
 @dataclass
@@ -96,12 +101,36 @@ class AppConfig:
             raise ConfigurationError("HTTP transport requires a valid host")
         if not self.server.port:
             raise ConfigurationError("HTTP transport requires a valid port")
-        if self.server.mcp_auth_enabled and not self.server.mcp_bearer_token:
+        if self.server.mcp_auth_mode in {"bearer", "multi"} and (
+            not self.server.mcp_bearer_token
+        ):
             raise ConfigurationError(
-                "MCP_AUTH_ENABLED is true, but MCP_BEARER_TOKEN is empty. "
-                "Set MCP_BEARER_TOKEN to a strong random secret."
+                f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
+                "MCP_BEARER_TOKEN to be set."
             )
-        if self.server.host in ("0.0.0.0", "::") and not self.server.mcp_auth_enabled:
+        if self.server.mcp_auth_mode in {"oauth", "multi"}:
+            if not self.server.mcp_oauth_base_url:
+                raise ConfigurationError(
+                    f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
+                    "MCP_OAUTH_BASE_URL to be set."
+                )
+            if not self.server.mcp_oauth_client_id:
+                raise ConfigurationError(
+                    f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
+                    "MCP_OAUTH_CLIENT_ID to be set."
+                )
+            if not self.server.mcp_oauth_client_secret:
+                raise ConfigurationError(
+                    f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
+                    "MCP_OAUTH_CLIENT_SECRET to be set."
+                )
+            if self.server.mcp_oauth_token_ttl_seconds <= 0:
+                raise ConfigurationError(
+                    "MCP_OAUTH_TOKEN_TTL_SECONDS must be positive."
+                )
+        if self.server.host in ("0.0.0.0", "::") and (
+            self.server.mcp_auth_mode == "none"
+        ):
             logger.warning(
                 "HTTP transport is binding to %s which exposes the server to "
                 "all network interfaces. The MCP endpoint has no authentication "
