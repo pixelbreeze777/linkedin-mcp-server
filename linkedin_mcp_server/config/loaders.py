@@ -59,6 +59,7 @@ class EnvironmentKeys:
     MCP_OAUTH_CLIENT_ID = "MCP_OAUTH_CLIENT_ID"
     MCP_OAUTH_CLIENT_SECRET = "MCP_OAUTH_CLIENT_SECRET"
     MCP_OAUTH_TOKEN_TTL_SECONDS = "MCP_OAUTH_TOKEN_TTL_SECONDS"
+    MCP_OAUTH_ALLOWED_REDIRECT_URIS = "MCP_OAUTH_ALLOWED_REDIRECT_URIS"
 
 
 def is_interactive_environment() -> bool:
@@ -151,6 +152,11 @@ def load_from_env(config: AppConfig) -> AppConfig:
 
     if mcp_oauth_secret := os.environ.get(EnvironmentKeys.MCP_OAUTH_CLIENT_SECRET):
         config.server.mcp_oauth_client_secret = mcp_oauth_secret.strip()
+
+    if redirect_uris := os.environ.get(EnvironmentKeys.MCP_OAUTH_ALLOWED_REDIRECT_URIS):
+        config.server.mcp_oauth_allowed_redirect_uris = [
+            uri.strip() for uri in redirect_uris.split(",") if uri.strip()
+        ]
 
     if ttl_env := os.environ.get(EnvironmentKeys.MCP_OAUTH_TOKEN_TTL_SECONDS):
         try:

@@ -28,6 +28,7 @@ class TestSequentialToolExecutionMiddleware:
     ):
         monkeypatch.setattr("sys.argv", ["linkedin-mcp-server"])
         monkeypatch.setenv("TRANSPORT", "streamable-http")
+        monkeypatch.setenv("MCP_AUTH_MODE", "bearer")
         monkeypatch.setenv("MCP_AUTH_ENABLED", "true")
         monkeypatch.setenv("MCP_BEARER_TOKEN", "test-token")
         mcp = create_mcp_server()
@@ -43,6 +44,10 @@ class TestSequentialToolExecutionMiddleware:
         monkeypatch.setenv("MCP_OAUTH_BASE_URL", "https://example.com")
         monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
         monkeypatch.setenv("MCP_OAUTH_CLIENT_SECRET", "secret")
+        monkeypatch.setenv(
+            "MCP_OAUTH_ALLOWED_REDIRECT_URIS",
+            "https://claude.ai/api/mcp/auth_callback",
+        )
         mcp = create_mcp_server()
 
         assert mcp.auth is not None

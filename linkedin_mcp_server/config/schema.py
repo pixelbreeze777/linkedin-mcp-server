@@ -77,6 +77,7 @@ class ServerConfig:
     mcp_oauth_client_id: str | None = None
     mcp_oauth_client_secret: str | None = None
     mcp_oauth_token_ttl_seconds: int = 3600
+    mcp_oauth_allowed_redirect_uris: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -123,6 +124,11 @@ class AppConfig:
                 raise ConfigurationError(
                     f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
                     "MCP_OAUTH_CLIENT_SECRET to be set."
+                )
+            if not self.server.mcp_oauth_allowed_redirect_uris:
+                raise ConfigurationError(
+                    f"MCP_AUTH_MODE={self.server.mcp_auth_mode} requires "
+                    "MCP_OAUTH_ALLOWED_REDIRECT_URIS to be set."
                 )
             if self.server.mcp_oauth_token_ttl_seconds <= 0:
                 raise ConfigurationError(

@@ -59,6 +59,19 @@ class TestAppConfig:
         with pytest.raises(ConfigurationError, match="MCP_OAUTH_BASE_URL"):
             config.validate()
 
+    def test_validate_streamable_http_oauth_requires_redirect_uris(self):
+        config = AppConfig()
+        config.server.transport = "streamable-http"
+        config.server.mcp_auth_mode = "oauth"
+        config.server.mcp_oauth_base_url = "https://example.com"
+        config.server.mcp_oauth_client_id = "cid"
+        config.server.mcp_oauth_client_secret = "secret"
+        with pytest.raises(
+            ConfigurationError,
+            match="MCP_OAUTH_ALLOWED_REDIRECT_URIS",
+        ):
+            config.validate()
+
 
 class TestConfigSingleton:
     def test_get_config_returns_same_instance(self, monkeypatch):
@@ -227,6 +240,7 @@ class TestLoaders:
         assert config.browser.user_data_dir == "/custom/profile"
 
     def test_load_from_env_mcp_auth_enabled_true(self, monkeypatch):
+        monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
         monkeypatch.setenv("MCP_AUTH_ENABLED", "true")
         from linkedin_mcp_server.config.loaders import load_from_env
 
@@ -235,6 +249,7 @@ class TestLoaders:
         assert config.server.mcp_auth_mode == "bearer"
 
     def test_load_from_env_mcp_auth_enabled_false(self, monkeypatch):
+        monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
         monkeypatch.setenv("MCP_AUTH_ENABLED", "off")
         from linkedin_mcp_server.config.loaders import load_from_env
 
@@ -280,6 +295,10 @@ class TestLoaders:
         monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
         monkeypatch.setenv("MCP_OAUTH_CLIENT_SECRET", "secret")
         monkeypatch.setenv("MCP_OAUTH_TOKEN_TTL_SECONDS", "1200")
+        monkeypatch.setenv(
+            "MCP_OAUTH_ALLOWED_REDIRECT_URIS",
+            "https://claude.ai/api/mcp/auth_callback, https://example.com/cb",
+        )
         from linkedin_mcp_server.config.loaders import load_from_env
 
         config = load_from_env(AppConfig())
@@ -287,3 +306,7 @@ class TestLoaders:
         assert config.server.mcp_oauth_client_id == "cid"
         assert config.server.mcp_oauth_client_secret == "secret"
         assert config.server.mcp_oauth_token_ttl_seconds == 1200
+        assert config.server.mcp_oauth_allowed_redirect_uris == [
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://example.com/cb",
+        ]

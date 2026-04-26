@@ -69,6 +69,7 @@ def create_mcp_server() -> FastMCP:
                 base_url=config.server.mcp_oauth_base_url,
                 client_id=config.server.mcp_oauth_client_id,
                 client_secret=config.server.mcp_oauth_client_secret,
+                allowed_redirect_uris=config.server.mcp_oauth_allowed_redirect_uris,
                 token_ttl_seconds=config.server.mcp_oauth_token_ttl_seconds,
             )
             logger.info("MCP HTTP OAuth auth is enabled")
@@ -83,6 +84,7 @@ def create_mcp_server() -> FastMCP:
                 base_url=config.server.mcp_oauth_base_url,
                 client_id=config.server.mcp_oauth_client_id,
                 client_secret=config.server.mcp_oauth_client_secret,
+                allowed_redirect_uris=config.server.mcp_oauth_allowed_redirect_uris,
                 token_ttl_seconds=config.server.mcp_oauth_token_ttl_seconds,
             )
             bearer = BearerTokenVerifier(expected_token=config.server.mcp_bearer_token)
