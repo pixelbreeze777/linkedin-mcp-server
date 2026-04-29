@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import random
 import re
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
@@ -46,9 +47,11 @@ WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
 # Delay between page navigations to avoid rate limiting
 _NAV_DELAY = 2.0
+_NAV_DELAY_JITTER = 0.8
 
 # Backoff before retrying a rate-limited page
 _RATE_LIMIT_RETRY_DELAY = 5.0
+_MAX_ADAPTIVE_SCALE = 3.0
 
 # Returned as section text when LinkedIn rate-limits the page
 _RATE_LIMITED_MSG = "[Rate limited] LinkedIn blocked this section. Try again later or request fewer sections."
@@ -214,6 +217,35 @@ class LinkedInExtractor:
 
     def __init__(self, page: Page):
         self._page = page
+        self._nav_delay_scale = 1.0
+
+    async def _sleep_with_jitter(
+        self,
+        base_seconds: float,
+        *,
+        jitter_seconds: float,
+    ) -> None:
+        """Sleep with bounded random jitter to avoid deterministic patterns."""
+        wait_seconds = max(0.0, base_seconds + random.uniform(0.0, jitter_seconds))
+        await asyncio.sleep(wait_seconds)
+
+    async def _adaptive_nav_pause(self) -> None:
+        """Pause between navigations using adaptive backoff and jitter."""
+        await self._sleep_with_jitter(
+            _NAV_DELAY * self._nav_delay_scale,
+            jitter_seconds=_NAV_DELAY_JITTER,
+        )
+
+    def _mark_rate_limited(self) -> None:
+        """Increase pacing after a rate-limit signal."""
+        self._nav_delay_scale = min(
+            _MAX_ADAPTIVE_SCALE,
+            self._nav_delay_scale * 1.35,
+        )
+
+    def _mark_navigation_success(self) -> None:
+        """Gradually decay adaptive pacing back to baseline."""
+        self._nav_delay_scale = max(1.0, self._nav_delay_scale * 0.93)
 
     @staticmethod
     def _normalize_body_marker(value: Any) -> str:
@@ -668,8 +700,15 @@ class LinkedInExtractor:
 
             # Retry once after backoff
             logger.info("Retrying %s after %.0fs backoff", url, _RATE_LIMIT_RETRY_DELAY)
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
-            return await self._extract_page_once(url, section_name, max_scrolls)
+            self._mark_rate_limited()
+            await self._sleep_with_jitter(
+                _RATE_LIMIT_RETRY_DELAY * self._nav_delay_scale,
+                jitter_seconds=1.0,
+            )
+            retried = await self._extract_page_once(url, section_name, max_scrolls)
+            if retried.text != _RATE_LIMITED_MSG:
+                self._mark_navigation_success()
+            return retried
 
         except LinkedInScraperException:
             raise
@@ -831,8 +870,15 @@ class LinkedInExtractor:
                 url,
                 _RATE_LIMIT_RETRY_DELAY,
             )
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
-            return await self._extract_overlay_once(url, section_name)
+            self._mark_rate_limited()
+            await self._sleep_with_jitter(
+                _RATE_LIMIT_RETRY_DELAY * self._nav_delay_scale,
+                jitter_seconds=1.0,
+            )
+            retried = await self._extract_overlay_once(url, section_name)
+            if retried.text != _RATE_LIMITED_MSG:
+                self._mark_navigation_success()
+            return retried
 
         except LinkedInScraperException:
             raise
@@ -920,7 +966,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await asyncio.sleep(_NAV_DELAY)
+                    await self._adaptive_nav_pause()
 
                 url = base_url + suffix
                 try:
@@ -937,10 +983,13 @@ class LinkedInExtractor:
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
                         sections[section_name] = extracted.text
+                        self._mark_navigation_success()
                         if extracted.references:
                             references[section_name] = extracted.references
                     elif extracted.error:
                         section_errors[section_name] = extracted.error
+                    elif extracted.text == _RATE_LIMITED_MSG:
+                        self._mark_rate_limited()
 
                     if section_name == "main_profile" and profile_urn is None:
                         profile_urn = await self._extract_profile_urn()
@@ -1776,7 +1825,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await asyncio.sleep(_NAV_DELAY)
+                    await self._adaptive_nav_pause()
 
                 url = base_url + suffix
                 try:
@@ -1791,10 +1840,13 @@ class LinkedInExtractor:
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
                         sections[section_name] = extracted.text
+                        self._mark_navigation_success()
                         if extracted.references:
                             references[section_name] = extracted.references
                     elif extracted.error:
                         section_errors[section_name] = extracted.error
+                    elif extracted.text == _RATE_LIMITED_MSG:
+                        self._mark_rate_limited()
                 except LinkedInScraperException:
                     raise
                 except Exception as e:
@@ -1904,10 +1956,16 @@ class LinkedInExtractor:
                 url,
                 _RATE_LIMIT_RETRY_DELAY,
             )
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+            self._mark_rate_limited()
+            await self._sleep_with_jitter(
+                _RATE_LIMIT_RETRY_DELAY * self._nav_delay_scale,
+                jitter_seconds=1.0,
+            )
             result = await self._extract_search_page_once(url, section_name)
             if result.text == _RATE_LIMITED_MSG:
                 logger.warning("Search page %s still rate-limited after retry", url)
+            else:
+                self._mark_navigation_success()
             return result
 
         except LinkedInScraperException:
@@ -2089,7 +2147,7 @@ class LinkedInExtractor:
                 break
 
             if page_num > 0:
-                await asyncio.sleep(_NAV_DELAY)
+                await self._adaptive_nav_pause()
 
             url = (
                 base_url
@@ -2103,10 +2161,13 @@ class LinkedInExtractor:
                 )
 
                 if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
+                    if extracted.text == _RATE_LIMITED_MSG:
+                        self._mark_rate_limited()
                     if extracted.error:
                         section_errors["search_results"] = extracted.error
                     # Navigation failed or rate-limited; skip ID extraction
                     break
+                self._mark_navigation_success()
 
                 # Read total pages from pagination state (once only, best-effort)
                 if not total_pages_queried:
