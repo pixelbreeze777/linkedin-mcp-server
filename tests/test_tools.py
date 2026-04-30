@@ -672,17 +672,21 @@ class TestMessagingTools:
 
         tool_fn = await get_tool_fn(mcp, "send_message")
         result = await tool_fn(
-            "testuser",
             "Hello!",
             True,
             mock_context,
+            linkedin_username="testuser",
             extractor=mock_extractor,
         )
 
         assert result["status"] == "sent"
         assert result["sent"] is True
         mock_extractor.send_message.assert_awaited_once_with(
-            "testuser", "Hello!", confirm_send=True, profile_urn=None
+            "testuser",
+            "Hello!",
+            confirm_send=True,
+            thread_id=None,
+            profile_urn=None,
         )
 
     async def test_send_message_with_profile_urn(self, mock_context):
@@ -702,17 +706,54 @@ class TestMessagingTools:
 
         tool_fn = await get_tool_fn(mcp, "send_message")
         result = await tool_fn(
-            "testuser",
             "Hello!",
             True,
             mock_context,
+            linkedin_username="testuser",
             profile_urn="ACoAAB1IelEB",
             extractor=mock_extractor,
         )
 
         assert result["status"] == "sent"
         mock_extractor.send_message.assert_awaited_once_with(
-            "testuser", "Hello!", confirm_send=True, profile_urn="ACoAAB1IelEB"
+            "testuser",
+            "Hello!",
+            confirm_send=True,
+            thread_id=None,
+            profile_urn="ACoAAB1IelEB",
+        )
+
+    async def test_send_message_with_thread_id(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/thread/abc123/",
+            "status": "sent",
+            "message": "Message sent.",
+            "recipient_selected": True,
+            "sent": True,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "send_message")
+        result = await tool_fn(
+            "Hello via thread!",
+            True,
+            mock_context,
+            thread_id="abc123",
+            extractor=mock_extractor,
+        )
+
+        assert result["status"] == "sent"
+        mock_extractor.send_message.assert_awaited_once_with(
+            None,
+            "Hello via thread!",
+            confirm_send=True,
+            thread_id="abc123",
+            profile_urn=None,
         )
 
     async def test_send_message_error(self, mock_context):
@@ -731,10 +772,10 @@ class TestMessagingTools:
         tool_fn = await get_tool_fn(mcp, "send_message")
         with pytest.raises(ToolError, match="Session expired"):
             await tool_fn(
-                "testuser",
                 "Hello!",
                 True,
                 mock_context,
+                linkedin_username="testuser",
                 extractor=mock_extractor,
             )
 

@@ -86,12 +86,13 @@ def register_messaging_tools(mcp: FastMCP) -> None:
         """
         Read a specific messaging conversation.
 
-        Provide either linkedin_username or thread_id to identify the conversation.
+        Provide either thread_id or linkedin_username to identify the conversation.
+        If both are provided, thread_id is used.
 
         Args:
             ctx: FastMCP context for progress reporting
-            linkedin_username: LinkedIn username of the conversation participant
             thread_id: LinkedIn messaging thread ID
+            linkedin_username: LinkedIn username of the conversation participant
 
         Returns:
             Dict with url, sections (conversation -> raw text), and optional references.
@@ -189,24 +190,28 @@ def register_messaging_tools(mcp: FastMCP) -> None:
         exclude_args=["extractor"],
     )
     async def send_message(
-        linkedin_username: str,
         message: str,
         confirm_send: bool,
         ctx: Context,
+        linkedin_username: str | None = None,
+        thread_id: str | None = None,
         profile_urn: str | None = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Send a message to a LinkedIn user.
 
-        The recipient must be directly messageable from the profile page. This is a
-        write operation when confirm_send is True.
+        Preferred path is thread_id (existing conversation). If thread_id is not
+        provided, the tool falls back to profile-based routing via linkedin_username
+        (and optionally profile_urn). This is a write operation when confirm_send
+        is True.
 
         Args:
-            linkedin_username: LinkedIn username of the recipient
+            linkedin_username: LinkedIn username of the recipient (fallback path)
             message: The message text to send
             confirm_send: Must be True to send the message
             ctx: FastMCP context for progress reporting
+            thread_id: Optional LinkedIn messaging thread ID (preferred path)
             profile_urn: Optional profile URN (e.g. ACoAAB...) to construct the
                 compose URL directly. Providing this bypasses the Message-button
                 lookup and is more reliable when available. Obtain via
@@ -216,13 +221,22 @@ def register_messaging_tools(mcp: FastMCP) -> None:
         Returns:
             Dict with url, status, message, recipient_selected, and sent.
         """
+        if not thread_id and not linkedin_username:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "Provide at least one of thread_id or linkedin_username"
+                ),
+                "send_message",
+            )
+
         try:
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="send_message"
             )
             logger.info(
-                "Sending message to %s (confirm_send=%s)",
+                "Sending message: username=%s, thread_id=%s (confirm_send=%s)",
                 linkedin_username,
+                thread_id,
                 confirm_send,
             )
 
@@ -232,6 +246,7 @@ def register_messaging_tools(mcp: FastMCP) -> None:
                 linkedin_username,
                 message,
                 confirm_send=confirm_send,
+                thread_id=thread_id,
                 profile_urn=profile_urn,
             )
 

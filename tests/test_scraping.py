@@ -3067,6 +3067,48 @@ class TestGetConversation:
         with pytest.raises(LinkedInScraperException):
             await extractor.get_conversation()
 
+    async def test_thread_id_takes_priority_over_username(self, mock_page):
+        """get_conversation prefers thread_id when both identifiers are provided."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value={"text": "Hello!\nHi there!", "references": []},
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
+                return_value="Hello!\nHi there!",
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_references",
+                return_value=[],
+            ),
+        ):
+            await extractor.get_conversation(
+                linkedin_username="fallback-user",
+                thread_id="abc123",
+            )
+
+        nav_mock.assert_awaited_once_with(
+            "https://www.linkedin.com/messaging/thread/abc123/"
+        )
+
 
 class TestSearchConversations:
     async def test_returns_search_results(self, mock_page):
@@ -3118,6 +3160,63 @@ class TestSearchConversations:
 
 
 class TestSendMessage:
+    async def test_thread_id_path_skips_profile_lookup(self, mock_page):
+        """send_message with thread_id opens thread directly and skips profile lookup."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Test User",
+            ) as read_name_mock,
+            patch.object(
+                extractor,
+                "_resolve_message_compose_href",
+                new_callable=AsyncMock,
+                return_value=None,
+            ) as resolve_href_mock,
+            patch.object(
+                extractor,
+                "_wait_for_message_surface",
+                new_callable=AsyncMock,
+                return_value="composer",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_message_compose_box",
+                new_callable=AsyncMock,
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                extractor,
+                "_dismiss_message_ui",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.send_message(
+                None,
+                "Hello!",
+                confirm_send=False,
+                thread_id="abc123",
+            )
+
+        assert result["status"] == "confirmation_required"
+        first_nav_call = nav_mock.await_args_list[0].args[0]
+        assert first_nav_call == "https://www.linkedin.com/messaging/thread/abc123/"
+        read_name_mock.assert_not_awaited()
+        resolve_href_mock.assert_not_awaited()
+
     async def test_dry_run_returns_confirmation_required(self, mock_page):
         """send_message with confirm_send=False returns confirmation_required status."""
         extractor = LinkedInExtractor(mock_page)

@@ -2505,56 +2505,73 @@ class LinkedInExtractor:
 
     async def send_message(
         self,
-        linkedin_username: str,
+        linkedin_username: str | None,
         message: str,
         *,
         confirm_send: bool,
+        thread_id: str | None = None,
         profile_urn: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a LinkedIn user with explicit confirmation gating.
 
         Args:
-            linkedin_username: LinkedIn username of the recipient.
+            linkedin_username: LinkedIn username of the recipient (fallback path).
             message: The message text to send.
             confirm_send: Must be True to actually send (False does a dry run).
+            thread_id: Optional LinkedIn messaging thread ID (preferred path).
             profile_urn: Optional profile URN (e.g. ACoAAB...) to construct the
                 compose URL directly, bypassing the Message-button lookup.
         """
-        profile_url = f"https://www.linkedin.com/in/{linkedin_username}/"
-        await self._navigate_to_page(profile_url)
-        await detect_rate_limit(self._page)
-
-        try:
-            await self._page.wait_for_selector("main")
-        except PlaywrightTimeoutError:
-            logger.debug("Profile page did not load for %s", linkedin_username)
-
-        await handle_modal_close(self._page)
-        display_name = await self._read_profile_display_name()
-        if profile_urn:
-            # Build the full compose URL that LinkedIn's own Message button
-            # generates. The minimal ?recipient=<URN> form works for established
-            # connections but shows a "Say hello" widget (no compose box) for new
-            # connections. Adding profileUrn + screenContext + interop=msgOverlay
-            # consistently opens the real composer regardless of connection age.
-            _encoded = quote_plus(f"urn:li:fsd_profile:{profile_urn}")
-            compose_url: str | None = (
-                f"https://www.linkedin.com/messaging/compose/"
-                f"?profileUrn={_encoded}"
-                f"&recipient={profile_urn}"
-                f"&screenContext=NON_SELF_PROFILE_VIEW"
-                f"&interop=msgOverlay"
+        if not thread_id and not linkedin_username:
+            raise LinkedInScraperException(
+                "Provide at least one of thread_id or linkedin_username"
             )
+
+        display_name = ""
+        compose_url: str | None
+        navigation_target: str
+        recipient_selected = False
+        if thread_id:
+            compose_url = f"https://www.linkedin.com/messaging/thread/{thread_id}/"
+            navigation_target = compose_url
+            recipient_selected = True
         else:
-            compose_url = await self._resolve_message_compose_href()
-        if not compose_url:
-            return self._message_action_result(
-                profile_url,
-                "message_unavailable",
-                "LinkedIn did not expose a usable Message action for this profile.",
-            )
+            profile_url = f"https://www.linkedin.com/in/{linkedin_username}/"
+            await self._navigate_to_page(profile_url)
+            await detect_rate_limit(self._page)
 
-        await self._navigate_to_page(compose_url)
+            try:
+                await self._page.wait_for_selector("main")
+            except PlaywrightTimeoutError:
+                logger.debug("Profile page did not load for %s", linkedin_username)
+
+            await handle_modal_close(self._page)
+            display_name = await self._read_profile_display_name()
+            if profile_urn:
+                # Build the full compose URL that LinkedIn's own Message button
+                # generates. The minimal ?recipient=<URN> form works for established
+                # connections but shows a "Say hello" widget (no compose box) for new
+                # connections. Adding profileUrn + screenContext + interop=msgOverlay
+                # consistently opens the real composer regardless of connection age.
+                _encoded = quote_plus(f"urn:li:fsd_profile:{profile_urn}")
+                compose_url = (
+                    f"https://www.linkedin.com/messaging/compose/"
+                    f"?profileUrn={_encoded}"
+                    f"&recipient={profile_urn}"
+                    f"&screenContext=NON_SELF_PROFILE_VIEW"
+                    f"&interop=msgOverlay"
+                )
+            else:
+                compose_url = await self._resolve_message_compose_href()
+            if not compose_url:
+                return self._message_action_result(
+                    profile_url,
+                    "message_unavailable",
+                    "LinkedIn did not expose a usable Message action for this profile.",
+                )
+            navigation_target = compose_url
+
+        await self._navigate_to_page(navigation_target)
         await detect_rate_limit(self._page)
 
         try:
@@ -2570,11 +2587,19 @@ class LinkedInExtractor:
             message_surface,
         )
 
-        recipient_selected = False
+        if message_surface == "recipient_picker" and thread_id:
+            await self._dismiss_message_ui()
+            return self._message_action_result(
+                self._page.url,
+                "recipient_resolution_failed",
+                "LinkedIn opened a new-compose recipient picker instead of the requested thread.",
+                recipient_selected=False,
+            )
+
         if message_surface == "recipient_picker":
             recipient_selected = await self._select_message_recipient(
                 display_name or "",
-                linkedin_username,
+                linkedin_username or "",
             )
             logger.debug(
                 "Recipient picker selection for %s returned %s",
@@ -2610,22 +2635,25 @@ class LinkedInExtractor:
             linkedin_username,
         )
 
-        if not await self._compose_page_matches_recipient(
-            display_name or "",
-            linkedin_username,
-        ):
-            logger.debug(
-                "Recipient match still failed for %s after compose hydration",
-                linkedin_username,
-            )
-            await self._dismiss_message_ui()
-            return self._message_action_result(
-                self._page.url,
-                "recipient_resolution_failed",
-                "LinkedIn opened a compose page, but the visible recipient did not match the requested profile.",
-                recipient_selected=recipient_selected,
-            )
-        recipient_selected = True
+        if thread_id:
+            recipient_selected = True
+        else:
+            if not await self._compose_page_matches_recipient(
+                display_name or "",
+                linkedin_username or "",
+            ):
+                logger.debug(
+                    "Recipient match still failed for %s after compose hydration",
+                    linkedin_username,
+                )
+                await self._dismiss_message_ui()
+                return self._message_action_result(
+                    self._page.url,
+                    "recipient_resolution_failed",
+                    "LinkedIn opened a compose page, but the visible recipient did not match the requested profile.",
+                    recipient_selected=recipient_selected,
+                )
+            recipient_selected = True
 
         if not confirm_send:
             await self._dismiss_message_ui()
