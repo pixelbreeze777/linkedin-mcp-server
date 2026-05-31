@@ -36,6 +36,38 @@ EXTRACT_PENDING_INVITATIONS_SCRIPT = """() => {
         return null;
     };
 
+    const cards = [];
+    const seen = new Set();
+
+    const acceptButtons = Array.from(
+        document.querySelectorAll('main button, main div[role="button"]')
+    ).filter(btn => {
+        const aria = normalize(btn.getAttribute('aria-label')).toLowerCase();
+        const text = normalize(btn.innerText).toLowerCase();
+        if (aria.includes('ignore') || text === 'ignore') return false;
+        return aria.includes('accept') || text === 'accept';
+    });
+
+    for (const btn of acceptButtons) {
+        const card =
+            btn.closest('[data-view-name*="invitation"]') ||
+            btn.closest('li') ||
+            btn.closest('div[data-chameleon-result-urn]') ||
+            btn.parentElement?.parentElement?.parentElement?.parentElement;
+
+        const profileLink = card?.querySelector('a[href*="/in/"]');
+        const profilePath = parseProfilePath(profileLink?.getAttribute('href'));
+        if (!profilePath) continue;
+
+        let invitationId = findInvitationId(card) || findInvitationId(btn);
+        if (!invitationId) {
+            const urnAttr = card?.getAttribute('data-chameleon-result-urn') || '';
+            if (urnAttr) invitationId = urnAttr;
+        }
+        if (!invitationId) {
+            invitationId = profilePath.replace(/^\\/in\\//, '').replace(/\\/$/, '');
+        }
+
         if (seen.has(invitationId)) continue;
         seen.add(invitationId);
 
