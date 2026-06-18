@@ -1,6 +1,6 @@
 """Tests for the LinkedInExtractor scraping engine."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,14 +11,15 @@ from linkedin_mcp_server.core.exceptions import (
 )
 from linkedin_mcp_server.scraping.connection import (
     ActionSignals,
-    _action_area,
     detect_connection_state,
 )
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
     _RATE_LIMITED_MSG,
+    _build_feed_references,
     _truncate_linkedin_noise,
+    strip_conversation_chrome,
     strip_linkedin_noise,
 )
 from linkedin_mcp_server.scraping.link_metadata import Reference
@@ -842,52 +843,123 @@ class TestScrapePersonUrls:
 
 
 class TestDetectConnectionState:
-    """Tests for connection state detection from profile text."""
+    """Tests for locale-independent connection-state detection.
 
-    def test_already_connected(self):
-        text = "Collin Pfeifer\n\n· 1st\n\nAI Engineer\n\nMessage\nMore"
-        assert detect_connection_state(text) == "already_connected"
+    Every state is decided purely from the structural ActionSignals; no
+    profile text is read for any state, including incoming_request (whose
+    Accept/Ignore action row is fingerprinted by ``has_incoming_action_row``).
+    """
 
-    def test_pending(self):
-        text = "Marinus Prey\n\n· 2nd\n\nStudent\n\nMessage\nPending\nMore"
-        assert detect_connection_state(text) == "pending"
+    @staticmethod
+    def _signals(
+        invite: bool = False,
+        compose_in_root: bool = False,
+        edit: bool = False,
+        labeled_action: bool = False,
+        labeled_anchor: bool = False,
+        incoming_row: bool = False,
+    ) -> ActionSignals:
+        return ActionSignals(
+            has_invite_anchor=invite,
+            has_compose_anchor_in_action_root=compose_in_root,
+            has_edit_intro_anchor=edit,
+            has_labeled_action_button=labeled_action,
+            has_labeled_action_anchor=labeled_anchor,
+            has_incoming_action_row=incoming_row,
+        )
 
-    def test_incoming_request(self):
-        text = "Aklasur Rahman\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore"
-        assert detect_connection_state(text) == "incoming_request"
+    def test_self_profile(self):
+        assert detect_connection_state(self._signals(edit=True)) == "self_profile"
 
     def test_connectable(self):
-        text = "Jane Doe\n\n· 3rd\n\nEngineer\n\nConnect\nMore"
-        assert detect_connection_state(text) == "connectable"
+        assert detect_connection_state(self._signals(invite=True)) == "connectable"
+
+    def test_already_connected(self):
+        # 1st-degree: Message anchor in action root, but no Follow/Connect/Pending
+        # button (no aria-label on any action-root button).
+        assert (
+            detect_connection_state(
+                self._signals(compose_in_root=True, labeled_action=False)
+            )
+            == "already_connected"
+        )
 
     def test_follow_only(self):
-        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMore"
-        assert detect_connection_state(text) == "follow_only"
-
-    def test_unavailable(self):
-        text = "Unknown Person\n\nSome text here"
-        assert detect_connection_state(text) == "unavailable"
-
-    def test_follow_in_interests_not_matched(self):
-        """Follow in the Interests section should not cause a false positive."""
-        text = (
-            "Jane Doe\n\n· 2nd\n\nEngineer\n\nConnect\nMore\n"
-            "About\n\nSome bio\n\nInterests\n\n"
-            "Elon Musk\n101,000 followers\nFollow"
+        # No invite anchor anywhere, but a primary action <button> (Follow
+        # / Save in Sales Navigator) is present alongside the Message
+        # anchor.
+        assert (
+            detect_connection_state(
+                self._signals(compose_in_root=True, labeled_action=True)
+            )
+            == "follow_only"
         )
-        assert detect_connection_state(text) == "connectable"
 
-    def test_action_area_cuts_at_about(self):
-        text = "Name\n\nConnect\nMore\nAbout\n\nFollow\nConnect"
-        area = _action_area(text)
-        assert "About" not in area
-        assert "Follow" not in area
+    def test_pending_via_labeled_anchor(self):
+        # Pending is rendered as <a aria-label="Pending, click to ..."> in
+        # the action root — distinct from Follow's <button aria-label=...>.
+        assert (
+            detect_connection_state(
+                self._signals(compose_in_root=True, labeled_anchor=True)
+            )
+            == "pending"
+        )
 
-    def test_action_area_cuts_at_highlights(self):
-        text = "Name\n\nMessage\nPending\nMore\nHighlights\n\nFollow"
-        area = _action_area(text)
-        assert "Follow" not in area
-        assert "Pending" in area
+    def test_pending_takes_priority_over_already_connected(self):
+        # If the labeled anchor is present alongside compose-in-root with
+        # no labeled button, pending wins over the already_connected
+        # fallthrough that would otherwise apply.
+        assert (
+            detect_connection_state(
+                self._signals(compose_in_root=True, labeled_anchor=True)
+            )
+            == "pending"
+        )
+
+    def test_incoming_request_via_structural_row(self):
+        assert (
+            detect_connection_state(self._signals(incoming_row=True))
+            == "incoming_request"
+        )
+
+    def test_incoming_structural_beats_pending_misclassification(self):
+        # Regression for the sidebar mis-anchor: on incoming profiles the
+        # compose-anchor action-root walk lands on sidebar cards and
+        # produces garbage signals (compose, labeled button, labeled
+        # anchor all True). The structural incoming signal must win over
+        # the pending check those garbage signals would trigger.
+        assert (
+            detect_connection_state(
+                self._signals(
+                    incoming_row=True,
+                    compose_in_root=True,
+                    labeled_action=True,
+                    labeled_anchor=True,
+                )
+            )
+            == "incoming_request"
+        )
+
+    def test_connectable_takes_priority_over_incoming_row(self):
+        assert (
+            detect_connection_state(self._signals(invite=True, incoming_row=True))
+            == "connectable"
+        )
+
+    def test_self_profile_takes_priority_over_incoming_row(self):
+        assert (
+            detect_connection_state(self._signals(edit=True, incoming_row=True))
+            == "self_profile"
+        )
+
+    def test_unavailable_when_no_signals(self):
+        assert detect_connection_state(self._signals()) == "unavailable"
+
+    def test_unavailable_when_compose_missing(self):
+        # Restricted profile: no compose anchor, no labels, no invite.
+        assert (
+            detect_connection_state(self._signals(labeled_action=True)) == "unavailable"
+        )
 
 
 class TestConnectWithPerson:
@@ -913,12 +985,20 @@ class TestConnectWithPerson:
 
     @staticmethod
     def _signals(
-        invite: bool = False, compose: bool = False, edit: bool = False
+        invite: bool = False,
+        compose: bool = False,
+        edit: bool = False,
+        labeled_action: bool = False,
+        labeled_anchor: bool = False,
+        incoming_row: bool = False,
     ) -> ActionSignals:
         return ActionSignals(
             has_invite_anchor=invite,
-            has_compose_anchor=compose,
+            has_compose_anchor_in_action_root=compose,
             has_edit_intro_anchor=edit,
+            has_labeled_action_button=labeled_action,
+            has_labeled_action_anchor=labeled_anchor,
+            has_incoming_action_row=incoming_row,
         )
 
     async def test_connectable_navigates_deeplink_and_verifies(self, mock_page):
@@ -995,6 +1075,149 @@ class TestConnectWithPerson:
 
         assert result["status"] == "send_failed"
 
+    async def test_premium_upsell_message_reads_linkedin_dialog_text(self, mock_page):
+        """Premium upsell detection returns LinkedIn's raw dialog text."""
+        extractor = LinkedInExtractor(mock_page)
+        premium_link = MagicMock()
+        premium_link.wait_for = AsyncMock(return_value=None)
+        premium_link.is_visible = AsyncMock(return_value=True)
+        premium_link.inner_text = AsyncMock(return_value="fallback")
+        premium_link.first = premium_link
+        mock_page.locator.return_value = premium_link
+        mock_page.evaluate = AsyncMock(
+            return_value="Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium"
+        )
+
+        result = await extractor._get_premium_upsell_message(timeout=1234)
+
+        assert (
+            result
+            == "Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium"
+        )
+        mock_page.locator.assert_called_once_with(
+            'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
+        )
+        premium_link.wait_for.assert_awaited_once_with(state="visible", timeout=1234)
+
+    async def test_submit_invite_dialog_reports_premium_after_add_note(self, mock_page):
+        """Add-note Premium upsell is a note-limit block, not no-dialog."""
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        extractor = LinkedInExtractor(mock_page)
+        textarea = MagicMock()
+        textarea.count = AsyncMock(return_value=0)
+        add_note_button = MagicMock()
+        add_note_button.click = AsyncMock(return_value=None)
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=3)
+        buttons.nth.return_value = add_note_button
+
+        def locator_for(selector: str):
+            return textarea if "textarea" in selector else buttons
+
+        mock_page.locator.side_effect = locator_for
+        mock_page.wait_for_selector = AsyncMock(
+            side_effect=PlaywrightTimeoutError("textarea timeout")
+        )
+
+        with (
+            patch.object(
+                extractor, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                extractor,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value="Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium",
+            ) as mock_message,
+            patch.object(
+                extractor, "_dismiss_dialog", new_callable=AsyncMock
+            ) as mock_dismiss,
+        ):
+            result = await extractor._submit_invite_dialog("Hello")
+
+        assert result == (
+            False,
+            False,
+            "Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium",
+        )
+        add_note_button.click.assert_awaited_once()
+        mock_message.assert_awaited_once()
+        mock_dismiss.assert_awaited_once()
+
+    async def test_submit_invite_dialog_reports_premium_after_send_click_failure(
+        self, mock_page
+    ):
+        """Premium upsell intercepting the Send click is a note-limit block.
+
+        When LinkedIn swaps the invite dialog for the Premium upsell at the
+        moment of submit, the original primary button is detached or pointer-
+        event covered, so ``_click_dialog_primary_button`` and the keyboard
+        fallback both fail. Without the post-click upsell probe the caller
+        would dismiss the dialog and report ``connect_unavailable`` even
+        though LinkedIn's raw quota message is sitting in the visible modal.
+        """
+        extractor = LinkedInExtractor(mock_page)
+
+        # Textarea already exposed so the reveal/fill branch succeeds and the
+        # test focuses on the post-submit failure path.
+        textarea = MagicMock()
+        textarea.count = AsyncMock(return_value=1)
+        textarea.first = textarea
+        textarea.fill = AsyncMock()
+
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        primary_button = MagicMock()
+        primary_button.focus = AsyncMock()
+        buttons.nth.return_value = primary_button
+
+        def locator_for(selector: str):
+            return textarea if "textarea" in selector else buttons
+
+        mock_page.locator.side_effect = locator_for
+        mock_page.keyboard = MagicMock()
+        mock_page.keyboard.press = AsyncMock()
+
+        message = "You're out of free custom notes. Bypass the limit with Premium..."
+
+        with (
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                # First call: dialog open at entry. Second call: still open
+                # after the keyboard fallback, so sent remains False.
+                side_effect=[True, True],
+            ),
+            patch.object(
+                extractor,
+                "_fill_dialog_textarea",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                extractor,
+                "_click_dialog_primary_button",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                extractor,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=message,
+            ) as mock_message,
+            patch.object(
+                extractor, "_dismiss_dialog", new_callable=AsyncMock
+            ) as mock_dismiss,
+        ):
+            result = await extractor._submit_invite_dialog("Hello")
+
+        assert result == (False, False, message)
+        mock_message.assert_awaited_once()
+        mock_dismiss.assert_awaited_once()
+
     async def test_connectable_no_dialog_returns_connect_unavailable(self, mock_page):
         """Deeplink opened but no dialog appeared → connect_unavailable."""
         extractor = LinkedInExtractor(mock_page)
@@ -1055,27 +1278,14 @@ class TestConnectWithPerson:
         assert result["status"] == "connect_unavailable"
         assert "own profile" in result["message"]
 
-    async def test_returns_pending(self, mock_page):
+    async def test_connect_via_more_menu(self, mock_page):
+        """Follow-primary profile with Connect under More: detection sees
+        no invite anchor initially, _open_more_menu surfaces it, deeplink
+        fires."""
         extractor = LinkedInExtractor(mock_page)
-        text = "Marinus\n\n· 2nd\n\nStudent\n\nMessage\nPending\nMore\nAbout\n"
-
-        with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
-            patch.object(
-                extractor,
-                "_read_action_signals",
-                new_callable=AsyncMock,
-                return_value=self._signals(),
-            ),
-        ):
-            result = await extractor.connect_with_person("testuser")
-
-        assert result["status"] == "pending"
-
-    async def test_returns_incoming_request_accepted(self, mock_page):
-        extractor = LinkedInExtractor(mock_page)
-        pre = "Aklasur\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore\nAbout\n"
-        post = "Aklasur\n\n· 1st\n\nDhaka\n\nMessage\nMore\nAbout\n"
+        # Pre-More: Follow primary, Connect hidden under the More dropdown.
+        pre = "Christian\n\n· 2nd\n\nFounder\n\nFollow\nMessage\nMore\n"
+        post = "Christian\n\n· 2nd\n\nFounder\n\nMessage\nPending\nMore\n"
 
         with (
             patch.object(
@@ -1087,47 +1297,370 @@ class TestConnectWithPerson:
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                side_effect=[self._signals(), self._signals(compose=True)],
+                # 1st: follow_only (compose+labeled, no invite).
+                # 2nd: post-More reread reveals invite anchor.
+                # 3rd: post-deeplink verification — invite anchor gone.
+                side_effect=[
+                    self._signals(compose=True, labeled_action=True),
+                    self._signals(invite=True, compose=True, labeled_action=True),
+                    self._signals(),
+                ],
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_open_more_menu",
                 new_callable=AsyncMock,
                 return_value=True,
-            ) as mock_click,
+            ) as mock_open_more,
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                extractor,
+                "_click_dialog_primary_button",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
         ):
             result = await extractor.connect_with_person("testuser")
 
-        assert result["status"] == "accepted"
-        mock_click.assert_awaited_once_with("Accept", scope="main")
+        assert result["status"] == "connected"
+        mock_open_more.assert_awaited_once()
+        # Deeplink fired exactly once.
+        assert mock_nav.await_count == 1
+        await_args = mock_nav.await_args
+        assert await_args is not None
+        assert "preload/custom-invite" in await_args.args[0]
 
-    async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
-        """Accept clicked but profile never transitions to 1st-degree."""
+    async def test_follow_only_after_more_does_not_send(self, mock_page):
+        """Pending or genuinely follow-only profile: invite anchor never
+        appears even after More-menu open. Critical write-gate guardrail —
+        no deeplink fires, no connection request goes out."""
         extractor = LinkedInExtractor(mock_page)
-        pre = "Aklasur\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore\nAbout\n"
+        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                # Both reads (initial + post-More) show no invite anchor.
+                side_effect=[
+                    self._signals(compose=True, labeled_action=True),
+                    self._signals(compose=True, labeled_action=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_open_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_open_more,
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                extractor, "_submit_invite_dialog", new_callable=AsyncMock
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "connect_unavailable"
+        assert result.get("note_sent") is False or "note_sent" not in result
+        mock_open_more.assert_awaited_once()
+        # Critical: deeplink must NOT fire and dialog must NOT be submitted.
+        mock_nav.assert_not_awaited()
+        mock_submit.assert_not_awaited()
+
+    async def test_follow_only_with_note_reports_note_limit_from_deeplink_probe(
+        self, mock_page
+    ):
+        """A requested note may reveal Premium quota without submitting."""
+        extractor = LinkedInExtractor(mock_page)
+        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    self._signals(compose=True, labeled_action=True),
+                    self._signals(compose=True, labeled_action=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_open_more_menu",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                extractor,
+                "_probe_invite_note_limit",
+                new_callable=AsyncMock,
+                return_value="Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium",
+            ) as mock_probe,
+            patch.object(
+                extractor, "_submit_invite_dialog", new_callable=AsyncMock
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser", note="Hello")
+
+        assert result["status"] == "custom_note_limit_reached"
+        assert (
+            result["message"]
+            == "Wysyłaj nieograniczoną liczbę spersonalizowanych zaproszeń dzięki Premium"
+        )
+        assert result["note_sent"] is False
+        mock_nav.assert_awaited_once()
+        mock_probe.assert_awaited_once()
+        mock_submit.assert_not_awaited()
+
+    async def test_more_menu_unavailable_does_not_send(self, mock_page):
+        """Action root present but no More button (unusual but possible):
+        _open_more_menu returns False, no retry, no deeplink fires."""
+        extractor = LinkedInExtractor(mock_page)
+        text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(compose=True, labeled_action=True),
+            ),
+            patch.object(
+                extractor,
+                "_open_more_menu",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                extractor, "_submit_invite_dialog", new_callable=AsyncMock
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "connect_unavailable"
+        mock_nav.assert_not_awaited()
+        mock_submit.assert_not_awaited()
+
+    async def test_returns_pending(self, mock_page):
+        """Profile with a pending invitation: detected via labeled <a> in
+        the action root. Returns status='pending' without firing the
+        deeplink (LinkedIn would only show 'already invited' anyway)."""
+        extractor = LinkedInExtractor(mock_page)
+        text = "Frank\n\n· 3rd\n\nFounder\n\nMessage\nPending\nMore\n"
+
+        with (
+            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(compose=True, labeled_anchor=True),
+            ),
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                extractor, "_submit_invite_dialog", new_callable=AsyncMock
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "pending"
+        # No write-path side effects.
+        mock_nav.assert_not_awaited()
+        mock_submit.assert_not_awaited()
+
+    async def test_returns_incoming_request_accepted(self, mock_page):
+        """Structural detection + structural accept click, German locale."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+        post = "Eric\n\n· 1.\n\nAachen\n\nNachricht\nMehr\nInfo\n"
 
         with (
             patch.object(
                 extractor,
                 "scrape_person",
-                self._mock_scrape(pre, follow_up_text=pre),
+                self._mock_scrape(pre, follow_up_text=post),
             ),
             patch.object(
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                side_effect=[self._signals(), self._signals()],
+                side_effect=[
+                    self._signals(incoming_row=True),
+                    self._signals(compose=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_accept,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+            patch.object(
+                extractor,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+            ) as mock_submit,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "accepted"
+        mock_accept.assert_awaited_once()
+        mock_nav.assert_not_awaited()
+        mock_submit.assert_not_awaited()
+
+    async def test_incoming_request_send_failed_when_click_fails(self, mock_page):
+        """Structural accept click did not land; no locale-text guessing —
+        report send_failed without navigating or clicking by text."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                self._mock_scrape(pre),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch.object(
                 extractor,
                 "click_button_by_text",
                 new_callable=AsyncMock,
                 return_value=True,
+            ) as mock_text_click,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "send_failed"
+        mock_nav.assert_not_awaited()
+        # No text-based clicking on the destructive accept path.
+        mock_text_click.assert_not_awaited()
+
+    async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
+        """Accept clicked but profile never transitions to 1st-degree."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                AsyncMock(
+                    return_value={
+                        "url": "https://www.linkedin.com/in/testuser/",
+                        "sections": {"main_profile": pre},
+                    }
+                ),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
             ),
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "send_failed"
+
+    async def test_incoming_request_accepted_on_settle_retry(self, mock_page):
+        """The first post-click read still renders the old top card;
+        the settle retry sees the 1st-degree state and reports accepted."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+        post = "Eric\n\n· 1.\n\nAachen\n\nNachricht\nMehr\nInfo\n"
+        page = {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sections": {"main_profile": pre},
+        }
+        page_post = {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sections": {"main_profile": post},
+        }
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                AsyncMock(side_effect=[page, page, page_post]),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    self._signals(incoming_row=True),
+                    self._signals(incoming_row=True),
+                    self._signals(compose=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as mock_sleep,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "accepted"
+        mock_sleep.assert_awaited_once()
 
     async def test_returns_unavailable_when_no_signals_and_text(self, mock_page):
         """No structural signals, no actionable text → connect_unavailable."""
@@ -1169,6 +1702,211 @@ class TestConnectWithPerson:
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "unavailable"
+
+    async def test_submit_invite_dialog_handles_two_button_gating_dialog(
+        self, mock_page
+    ):
+        """Two-button "Add a note to your invitation?" gating dialog (issue
+        #455): nth(0) is "Add a note", nth(1) is "Send without a note".
+
+        Asserts the secondary-button click that reveals the textarea fires
+        even with btn_count == 2 (legacy guard required >= 3 and skipped
+        the click, leaving the textarea unmounted)."""
+        extractor = LinkedInExtractor(mock_page)
+
+        # Track each button click so we can assert the "Add a note" path
+        # was taken to reveal the textarea.
+        clicks: list[int] = []
+
+        textarea_visible = {"value": False}
+
+        # Two button locators inside the gating dialog: nth(0) "Add a
+        # note" reveals the textarea, nth(1) "Send without a note".
+        button_locators = [MagicMock(), MagicMock()]
+        for idx, btn in enumerate(button_locators):
+
+            def make_click(i: int):
+                async def _click(*args, **kwargs):
+                    clicks.append(i)
+                    if i == 0:
+                        textarea_visible["value"] = True
+                    return None
+
+                return _click
+
+            btn.click = AsyncMock(side_effect=make_click(idx))
+            btn.focus = AsyncMock()
+
+        button_collection = MagicMock()
+        button_collection.count = AsyncMock(return_value=2)
+        button_collection.nth = MagicMock(side_effect=lambda i: button_locators[i])
+
+        textarea_locator = MagicMock()
+        textarea_locator.count = AsyncMock(
+            side_effect=lambda: 1 if textarea_visible["value"] else 0
+        )
+        textarea_locator.first = textarea_locator
+        textarea_locator.fill = AsyncMock()
+
+        # Route page.locator() calls by selector — buttons vs textarea —
+        # so the gating dialog's button collection is distinguishable
+        # from the textarea probe.
+        def locator_router(selector: str):
+            if "textarea" in selector:
+                return textarea_locator
+            return button_collection
+
+        mock_page.locator = MagicMock(side_effect=locator_router)
+        mock_page.wait_for_selector = AsyncMock()
+        mock_page.keyboard = MagicMock()
+        mock_page.keyboard.press = AsyncMock()
+
+        with (
+            patch.object(
+                extractor, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                extractor,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            (
+                submitted,
+                note_sent,
+                note_limit_message,
+            ) = await extractor._submit_invite_dialog("Hi from a test")
+
+        assert submitted is True
+        assert note_sent is True
+        assert note_limit_message is None
+        # Clicked "Add a note" (index 0) to reveal the textarea, then the
+        # primary button (index 1) to send.
+        assert clicks == [0, 1]
+        textarea_locator.fill.assert_awaited_once()
+
+    async def test_references_are_grouped_by_section(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted(
+                        "profile text",
+                        [
+                            {
+                                "kind": "person",
+                                "url": "/in/testuser/",
+                                "text": "Test User",
+                            }
+                        ],
+                    ),
+                    extracted(
+                        "post text",
+                        [
+                            {
+                                "kind": "article",
+                                "url": "/pulse/test-post/",
+                                "text": "Test post",
+                            }
+                        ],
+                    ),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person("testuser", {"posts"})
+
+        assert result["references"] == {
+            "main_profile": [
+                {"kind": "person", "url": "/in/testuser/", "text": "Test User"}
+            ],
+            "posts": [
+                {"kind": "article", "url": "/pulse/test-post/", "text": "Test post"}
+            ],
+        }
+
+    async def test_error_isolation(self, mock_page):
+        """One section failing doesn't block others."""
+
+        async def extract_with_failure(url, *args, **kwargs):
+            if "experience" in url:
+                raise Exception("Simulated failure")
+            return extracted(f"text for {url}")
+
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                side_effect=extract_with_failure,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_issue_diagnostics",
+                return_value={"issue_template_path": "/tmp/issue.md"},
+            ),
+            patch.object(
+                extractor,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person(
+                "testuser", {"main_profile", "experience", "education"}
+            )
+
+        # main_profile and education should have sections, experience should not
+        assert "main_profile" in result["sections"]
+        assert "education" in result["sections"]
+        assert "experience" not in result["sections"]
+        assert result["section_errors"]["experience"]["issue_template_path"] == (
+            "/tmp/issue.md"
+        )
+
+    async def test_rate_limited_sections_are_omitted(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted(_RATE_LIMITED_MSG),
+                    extracted("Post text"),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person("testuser", {"posts"})
+
+        assert "main_profile" not in result["sections"]
+        assert result["sections"]["posts"] == "Post text"
 
 
 class TestPendingInvitations:
@@ -1313,128 +2051,6 @@ class TestPendingInvitations:
 
         assert result["status"] == "already_accepted"
 
-    async def test_references_are_grouped_by_section(self, mock_page):
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(
-                extractor,
-                "extract_page",
-                new_callable=AsyncMock,
-                side_effect=[
-                    extracted(
-                        "profile text",
-                        [
-                            {
-                                "kind": "person",
-                                "url": "/in/testuser/",
-                                "text": "Test User",
-                            }
-                        ],
-                    ),
-                    extracted(
-                        "post text",
-                        [
-                            {
-                                "kind": "article",
-                                "url": "/pulse/test-post/",
-                                "text": "Test post",
-                            }
-                        ],
-                    ),
-                ],
-            ),
-            patch.object(
-                extractor,
-                "_extract_overlay",
-                new_callable=AsyncMock,
-                return_value=extracted(""),
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await extractor.scrape_person("testuser", {"posts"})
-
-        assert result["references"] == {
-            "main_profile": [
-                {"kind": "person", "url": "/in/testuser/", "text": "Test User"}
-            ],
-            "posts": [
-                {"kind": "article", "url": "/pulse/test-post/", "text": "Test post"}
-            ],
-        }
-
-    async def test_error_isolation(self, mock_page):
-        """One section failing doesn't block others."""
-
-        async def extract_with_failure(url, *args, **kwargs):
-            if "experience" in url:
-                raise Exception("Simulated failure")
-            return extracted(f"text for {url}")
-
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(
-                extractor,
-                "extract_page",
-                side_effect=extract_with_failure,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.build_issue_diagnostics",
-                return_value={"issue_template_path": "/tmp/issue.md"},
-            ),
-            patch.object(
-                extractor,
-                "_extract_overlay",
-                new_callable=AsyncMock,
-                return_value=extracted(""),
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await extractor.scrape_person(
-                "testuser", {"main_profile", "experience", "education"}
-            )
-
-        # main_profile and education should have sections, experience should not
-        assert "main_profile" in result["sections"]
-        assert "education" in result["sections"]
-        assert "experience" not in result["sections"]
-        assert result["section_errors"]["experience"]["issue_template_path"] == (
-            "/tmp/issue.md"
-        )
-
-    async def test_rate_limited_sections_are_omitted(self, mock_page):
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(
-                extractor,
-                "extract_page",
-                new_callable=AsyncMock,
-                side_effect=[
-                    extracted(_RATE_LIMITED_MSG),
-                    extracted("Post text"),
-                ],
-            ),
-            patch.object(
-                extractor,
-                "_extract_overlay",
-                new_callable=AsyncMock,
-                return_value=extracted(""),
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await extractor.scrape_person("testuser", {"posts"})
-
-        assert "main_profile" not in result["sections"]
-        assert result["sections"]["posts"] == "Post text"
-
 
 class TestScrapeCompany:
     async def test_company_baseline_always_included(self, mock_page):
@@ -1527,6 +2143,70 @@ class TestScrapeCompany:
 
         assert "about" not in result["sections"]
         assert result["sections"]["posts"] == "Posts text"
+
+    async def test_scrape_company_extracts_company_urn(self, mock_page):
+        """End-to-end: a canned-search anchor on the company about page
+        produces a ``company_urn`` reference with the parent-company id.
+
+        Stubs ``_extract_root_content`` (rather than ``extract_page``) so
+        the real ``build_references`` pipeline runs against raw anchor
+        data, mirroring what the JS crawler emits live.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        raw_root = {
+            "source": "root",
+            "text": "About SAP\nCompany overview",
+            "references": [
+                {
+                    "href": "https://www.linkedin.com/search/results/people/"
+                    "?currentCompany=%5B%221115%22%5D"
+                    "&origin=COMPANY_PAGE_CANNED_SEARCH",
+                    "text": "10K+ employees",
+                    "aria_label": "",
+                    "title": "",
+                    "heading": "",
+                    "in_article": False,
+                    "in_nav": False,
+                    "in_footer": False,
+                }
+            ],
+        }
+        with (
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=raw_root,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_company("sap", {"about"})
+
+        urns = [
+            ref for ref in result["references"]["about"] if ref["kind"] == "company_urn"
+        ]
+        assert len(urns) == 1
+        assert urns[0]["value"] == "1115"
+        assert urns[0]["url"] == (
+            "/search/results/people/?currentCompany=%5B%221115%22%5D"
+        )
+        assert "text" not in urns[0]
 
 
 class TestScrapeJob:
@@ -2084,6 +2764,91 @@ class TestSearchJobs:
         assert result["sections"] == {}
         assert "references" not in result
 
+    async def test_search_people_network_filter_first_degree(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", network=["F"])
+
+        assert "network=%5B%22F%22%5D" in result["url"]
+
+    async def test_search_people_network_filter_multi_degree(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", network=["F", "S"])
+
+        assert "network=%5B%22F%22%2C%22S%22%5D" in result["url"]
+
+    async def test_search_people_current_company_filter(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", current_company="1115")
+
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
+    async def test_search_people_invalid_network_token_raises(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="Invalid network token"):
+            await extractor.search_people("engineer", network=["X"])
+
+    async def test_search_people_rejects_plain_company_name(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="must be a numeric"):
+            await extractor.search_people("engineer", current_company="SAP")
+
+    async def test_search_people_rejects_unicode_digit_company(self, mock_page):
+        """LinkedIn URN ids are ASCII decimal; reject Unicode digits even
+        though ``str.isdigit()`` would accept them."""
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(ValueError, match="must be a numeric"):
+            await extractor.search_people("engineer", current_company="١١١٥")
+
+    async def test_search_people_empty_current_company_is_noop(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people("engineer", current_company="")
+
+        assert "currentCompany" not in result["url"]
+
+    async def test_search_people_combines_all_filters(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_page",
+            new_callable=AsyncMock,
+            return_value=extracted("Jane Doe"),
+        ):
+            result = await extractor.search_people(
+                "engineer",
+                location="Seattle",
+                network=["F"],
+                current_company="1115",
+            )
+
+        assert "keywords=engineer" in result["url"]
+        assert "location=Seattle" in result["url"]
+        assert "network=%5B%22F%22%5D" in result["url"]
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
 
 class TestStripLinkedInNoise:
     def test_strips_footer(self):
@@ -2154,6 +2919,137 @@ class TestStripLinkedInNoise:
             "Close modal window"
         )
         assert strip_linkedin_noise(text) == "Feed post number 1\nActual post content"
+
+
+class TestStripConversationChrome:
+    THREAD = (
+        "MAY 25\n"
+        "Grace Hopper sent the following message at 5:27 PM\n"
+        "Grace Hopper  5:27 PM\n"
+        "\n"
+        "Hello!"
+    )
+    PAGE = (
+        "Messaging\n"
+        "Search messages\n"
+        "Compose a new message\n"
+        "Inbox\n"
+        "Attention screen reader users, messaging items continuously update.\n"
+        "Ada Lovelace\n"
+        "Jun 8\n"
+        "Ada: Preview belonging to a different conversation\n"
+        ". Press return to go to conversation details\n"
+        "Open the options list in your conversation with Ada Lovelace and Grace Hopper\n"
+        "Status is reachable\n"
+        "Load more conversations\n"
+        "Grace Hopper\n"
+        "Status is online\n"
+        "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"
+        + THREAD
+        + "\n"
+        "Maximize compose field\n"
+        "Attach an image to your conversation with Grace Hopper\n"
+        "Open GIF Keyboard\n"
+        "Send\n"
+        "Open send options"
+    )
+
+    def test_strips_sidebar_and_composer(self):
+        assert strip_conversation_chrome(self.PAGE) == self.THREAD
+
+    def test_other_conversation_previews_removed(self):
+        assert "different conversation" not in strip_conversation_chrome(self.PAGE)
+        assert "Ada Lovelace" not in strip_conversation_chrome(self.PAGE)
+
+    def test_missing_composer_strips_only_leading_chrome(self):
+        text = (
+            "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"
+            + self.THREAD
+        )
+        assert strip_conversation_chrome(text) == self.THREAD
+
+    def test_missing_thread_header_strips_only_composer(self):
+        text = self.THREAD + "\nMaximize compose field\nOpen send options"
+        assert strip_conversation_chrome(text) == self.THREAD
+
+    def test_quoted_composer_string_in_message_survives(self):
+        text = (
+            "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"
+            "Maximize compose field\n"
+            "is the label I keep seeing\n"
+            "Maximize compose field\n"
+            "Open send options"
+        )
+        assert (
+            strip_conversation_chrome(text)
+            == "Maximize compose field\nis the label I keep seeing"
+        )
+
+    def test_quoted_companion_with_suffix_does_not_confirm_composer(self):
+        text = "Hello!\nMaximize compose field\nOpen send options is what I clicked"
+        assert strip_conversation_chrome(text) == text
+
+    def test_quoted_attach_text_does_not_confirm_composer(self):
+        text = (
+            "Hello!\n"
+            "Maximize compose field\n"
+            "Attach an image to your conversation with Grace is the label I clicked"
+        )
+        assert strip_conversation_chrome(text) == text
+
+    def test_distant_companion_text_does_not_confirm_composer(self):
+        filler = "\n".join(f"message {n}" for n in range(10))
+        text = (
+            "Maximize compose field\n"
+            + filler
+            + "\nOpen send options is what I clicked"
+        )
+        assert strip_conversation_chrome(text) == text
+
+    def test_quoted_composer_without_companions_does_not_truncate(self):
+        text = (
+            "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"
+            "Hello!\n"
+            "Maximize compose field\n"
+            "is what the button says"
+        )
+        assert (
+            strip_conversation_chrome(text)
+            == "Hello!\nMaximize compose field\nis what the button says"
+        )
+
+    def test_quoted_thread_header_in_message_keeps_earlier_messages(self):
+        text = (
+            "Load more conversations\n"
+            "Grace Hopper\n"
+            "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"
+            "Hello!\n"
+            "Open the options list in your conversation with is a label I quoted\n"
+            "Bye!\n"
+            "Maximize compose field\n"
+            "Open send options"
+        )
+        assert strip_conversation_chrome(text) == (
+            "Hello!\n"
+            "Open the options list in your conversation with is a label I quoted\n"
+            "Bye!"
+        )
+
+    def test_sidebar_end_without_thread_header_still_strips_sidebar(self):
+        text = (
+            "Ada: Preview belonging to a different conversation\n"
+            "Load more conversations\n" + self.THREAD
+        )
+        assert strip_conversation_chrome(text) == self.THREAD
+
+    def test_unknown_locale_returns_unchanged(self):
+        assert strip_conversation_chrome(self.PAGE, locale="de") == self.PAGE
+
+    def test_no_markers_returns_stripped_text(self):
+        assert strip_conversation_chrome("Hello!\nHi there!") == "Hello!\nHi there!"
+
+    def test_empty_string(self):
+        assert strip_conversation_chrome("") == ""
 
 
 class TestActivityFeedExtraction:
@@ -2521,6 +3417,92 @@ class TestActivityFeedExtraction:
         assert result.text == tab_headers
 
 
+class TestCompanyPeopleExtraction:
+    """Tests for /company/<slug>/people/ hydration wait in _extract_page_once."""
+
+    async def test_waits_for_listing_with_5s_timeout(self, mock_page):
+        """Company /people/ pages call wait_for_function so the employee
+        listing has hydrated before scroll/extract. Empty/restricted listings
+        are common, so the timeout is 5s rather than the 10s pattern shared
+        with is_search/is_details."""
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Anthropic\nFollowing\nHome\nAbout\nPeople",
+                "references": [],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock()
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ) as mock_scroll,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            await extractor._extract_page_once(
+                "https://www.linkedin.com/company/anthropicresearch/people/",
+                section_name="employees",
+            )
+
+        mock_page.wait_for_function.assert_awaited_once()
+        wait_predicate = mock_page.wait_for_function.call_args[0][0]
+        wait_kwargs = mock_page.wait_for_function.call_args.kwargs
+        assert "/in/" in wait_predicate
+        assert "querySelectorAll" in wait_predicate
+        assert wait_kwargs["timeout"] == 5000
+        mock_scroll.assert_awaited_once()
+
+    async def test_continues_extraction_on_wait_timeout(self, mock_page):
+        """When the hydration wait times out (genuinely empty listing), the
+        extractor swallows PlaywrightTimeoutError and still scrolls + extracts
+        rather than propagating the error to the caller."""
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "Empty company page",
+                "references": [],
+            }
+        )
+        mock_page.wait_for_function = AsyncMock(
+            side_effect=PlaywrightTimeoutError("Timeout")
+        )
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ) as mock_scroll,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await extractor._extract_page_once(
+                "https://www.linkedin.com/company/anthropicresearch/people/",
+                section_name="employees",
+            )
+
+        mock_scroll.assert_awaited_once()
+        assert result.text  # non-empty placeholder text from the mock
+
+
 class TestSearchResultsExtraction:
     """Tests for search results page detection and wait behavior in _extract_page_once."""
 
@@ -2723,6 +3705,116 @@ class TestScrapePersonCallbacks:
         assert isinstance(error_arg, LinkedInScraperException)
         assert "boom" in str(error_arg)
         cb.on_complete.assert_not_awaited()
+
+
+class TestMainProfileAlreadyLoaded:
+    """Reuse path for scrape_person when get_my_profile already loaded the page."""
+
+    async def test_get_my_profile_passes_already_loaded_flag(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/realuser/"
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock) as nav,
+            patch.object(
+                extractor,
+                "scrape_person",
+                new_callable=AsyncMock,
+                return_value={"url": "...", "sections": {}},
+            ) as scrape,
+        ):
+            await extractor.get_my_profile(sections={"main_profile"})
+
+        nav.assert_awaited_once_with("https://www.linkedin.com/in/me/")
+        assert scrape.await_count == 1
+        assert scrape.call_args.kwargs["main_profile_already_loaded"] is True
+
+    async def test_scrape_person_already_loaded_skips_navigation(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+        with (
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted("reused"),
+            ) as loaded,
+            patch.object(
+                extractor, "extract_page", new_callable=AsyncMock
+            ) as extract_page,
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock) as nav,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_not_awaited()
+        nav.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_url_mismatch_falls_back(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/feed/"
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted("fallback"),
+            ) as extract_page,
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+            ) as loaded,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        extract_page.assert_awaited_once()
+        loaded.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_rate_limit_falls_back(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+
+        from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
+
+        with (
+            patch.object(
+                extractor,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted(_RATE_LIMITED_MSG),
+            ) as loaded,
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted("retry succeeded"),
+            ) as extract_page,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_awaited_once()
+        assert result["sections"]["main_profile"] == "retry succeeded"
 
 
 class TestScrapeCompanyCallbacks:
@@ -3204,18 +4296,18 @@ class TestGetConversation:
         )
         assert result["sections"]["conversation"] == "Hello!\nHi there!"
 
-    async def test_raises_when_no_identifier(self, mock_page):
-        """get_conversation raises LinkedInScraperException with no args."""
+    async def test_strips_conversation_page_chrome(self, mock_page):
+        """get_conversation trims sidebar and composer chrome from the thread."""
+        raw = (
+            "Ada: Preview belonging to a different conversation\n"
+            "Open the options list in your conversation with Ada and Grace\n"
+            "Hello!\n"
+            "Maximize compose field\n"
+            "Open send options"
+        )
         extractor = LinkedInExtractor(mock_page)
-        with pytest.raises(LinkedInScraperException):
-            await extractor.get_conversation()
-
-    async def test_thread_id_takes_priority_over_username(self, mock_page):
-        """get_conversation prefers thread_id when both identifiers are provided."""
-        extractor = LinkedInExtractor(mock_page)
-        nav_mock = AsyncMock()
         with (
-            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
             patch(
                 "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
                 new_callable=AsyncMock,
@@ -3232,40 +4324,305 @@ class TestGetConversation:
                 extractor,
                 "_extract_root_content",
                 new_callable=AsyncMock,
-                return_value={"text": "Hello!\nHi there!", "references": []},
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
-                return_value="Hello!\nHi there!",
+                return_value={"text": raw, "references": []},
             ),
             patch(
                 "linkedin_mcp_server.scraping.extractor.build_references",
                 return_value=[],
             ),
         ):
-            await extractor.get_conversation(
-                linkedin_username="fallback-user",
-                thread_id="abc123",
-            )
+            result = await extractor.get_conversation(thread_id="abc123")
 
-        nav_mock.assert_awaited_once_with(
-            "https://www.linkedin.com/messaging/thread/abc123/"
+        assert result["sections"]["conversation"] == "Hello!"
+
+    async def test_raises_when_no_identifier(self, mock_page):
+        """get_conversation raises LinkedInScraperException with no args."""
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(LinkedInScraperException):
+            await extractor.get_conversation()
+
+    async def test_by_username_default_index_picks_first_thread(self, mock_page):
+        """get_conversation by username opens the 0th matching thread by default."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        mock_page.wait_for_selector = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Jacki McMahan",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_conversation_thread_urls",
+                new_callable=AsyncMock,
+                return_value=[
+                    "https://www.linkedin.com/messaging/thread/2-newer/",
+                    "https://www.linkedin.com/messaging/thread/2-older/",
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value={"text": "msg", "references": []},
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
+                return_value="msg",
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_references",
+                return_value=[],
+            ),
+        ):
+            await extractor.get_conversation(linkedin_username="jacki-old")
+
+        target_calls = [
+            c.args[0]
+            for c in nav_mock.call_args_list
+            if c.args and "/messaging/thread/" in c.args[0]
+        ]
+        assert target_calls == ["https://www.linkedin.com/messaging/thread/2-newer/"]
+
+    async def test_by_username_index_picks_specified_thread(self, mock_page):
+        """get_conversation by username + index opens the i-th matching thread."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        mock_page.wait_for_selector = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Jacki McMahan",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_conversation_thread_urls",
+                new_callable=AsyncMock,
+                return_value=[
+                    "https://www.linkedin.com/messaging/thread/2-newer/",
+                    "https://www.linkedin.com/messaging/thread/2-older/",
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value={"text": "msg", "references": []},
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
+                return_value="msg",
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_references",
+                return_value=[],
+            ),
+        ):
+            await extractor.get_conversation(linkedin_username="jacki-old", index=1)
+
+        target_calls = [
+            c.args[0]
+            for c in nav_mock.call_args_list
+            if c.args and "/messaging/thread/" in c.args[0]
+        ]
+        assert target_calls == ["https://www.linkedin.com/messaging/thread/2-older/"]
+
+    async def test_by_username_index_out_of_range_raises(self, mock_page):
+        """get_conversation raises when index exceeds the number of threads."""
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.wait_for_selector = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Jacki McMahan",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_conversation_thread_urls",
+                new_callable=AsyncMock,
+                return_value=[
+                    "https://www.linkedin.com/messaging/thread/2-only/",
+                ],
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException, match="out of range"):
+                await extractor.get_conversation(linkedin_username="jacki-old", index=5)
+
+    async def test_by_username_no_threads_raises_could_not_find(self, mock_page):
+        """get_conversation raises 'Could not find a conversation' when none exist."""
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.wait_for_selector = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Jacki McMahan",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_conversation_thread_urls",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            with pytest.raises(
+                LinkedInScraperException, match="Could not find a conversation"
+            ):
+                await extractor.get_conversation(linkedin_username="jacki-old")
+
+
+class TestStripSelectConversationPrefix:
+    def test_strips_en_us_prefix(self):
+        """Best-effort strip removes the en-US 'Select conversation with ' prefix."""
+        assert (
+            LinkedInExtractor._strip_select_conversation_prefix(
+                "Select conversation with Jacki McMahan"
+            )
+            == "Jacki McMahan"
         )
 
+    def test_case_insensitive(self):
+        assert (
+            LinkedInExtractor._strip_select_conversation_prefix(
+                "select conversation with jacki mcmahan"
+            )
+            == "jacki mcmahan"
+        )
 
-class TestSearchConversations:
-    async def test_returns_search_results(self, mock_page):
-        """search_conversations returns search_results section."""
+    def test_returns_full_aria_when_prefix_absent(self):
+        """In a non-en-US locale the verb prefix won't match; return as-is so
+        downstream matching can endsWith / endswith on the participant name."""
+        assert (
+            LinkedInExtractor._strip_select_conversation_prefix(
+                "Konversation auswählen mit Jacki McMahan"
+            )
+            == "Konversation auswählen mit Jacki McMahan"
+        )
+
+    def test_empty_input(self):
+        assert LinkedInExtractor._strip_select_conversation_prefix("") == ""
+
+
+class TestResolveConversationThreadUrls:
+    async def test_inbox_enumeration_and_exact_aria_match(self, mock_page):
+        """_resolve_conversation_thread_urls enumerates the plain inbox and
+        matches participant by exact aria-label rather than substring."""
         extractor = LinkedInExtractor(mock_page)
-        mock_searchbox = AsyncMock()
-        mock_searchbox.wait_for = AsyncMock()
-        mock_searchbox.click = AsyncMock()
-        mock_page.get_by_role = MagicMock(return_value=mock_searchbox)
-        mock_keyboard = MagicMock()
-        mock_keyboard.type = AsyncMock()
-        mock_keyboard.press = AsyncMock()
-        mock_page.keyboard = mock_keyboard
+        nav_mock = AsyncMock()
+        thread_refs = [
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-aaa/",
+                "text": "Jacki McMahan",  # exact match
+                "context": "search",
+            },
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-bbb/",
+                "text": "Jacki McMahan-Group",  # extra suffix → not exact
+                "context": "search",
+            },
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-ccc/",
+                "text": "Jacki McMahan",  # second exact match (multi-thread case)
+                "context": "search",
+            },
+        ]
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_conversation_thread_refs",
+                new_callable=AsyncMock,
+                return_value=thread_refs,
+            ),
+        ):
+            urls = await extractor._resolve_conversation_thread_urls("Jacki McMahan")
 
+        nav_mock.assert_awaited_once_with("https://www.linkedin.com/messaging/")
+        assert urls == [
+            "https://www.linkedin.com/messaging/thread/2-aaa/",
+            "https://www.linkedin.com/messaging/thread/2-ccc/",
+        ]
+
+    async def test_resolver_passes_name_filter_to_enumerator(self, mock_page):
+        """_resolve_conversation_thread_urls scopes the click side effect by
+        forwarding name_filter so only the participant's row is clicked."""
+        extractor = LinkedInExtractor(mock_page)
+        refs_mock = AsyncMock(
+            return_value=[
+                {
+                    "kind": "conversation",
+                    "url": "/messaging/thread/2-aaa/",
+                    "text": "Jacki McMahan",
+                    "context": "inbox",
+                },
+            ]
+        )
         with (
             patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
             patch(
@@ -3277,10 +4634,101 @@ class TestSearchConversations:
                 new_callable=AsyncMock,
             ),
             patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(extractor, "_extract_conversation_thread_refs", refs_mock),
+        ):
+            urls = await extractor._resolve_conversation_thread_urls("Jacki McMahan")
+
+        refs_mock.assert_awaited_once_with(
+            limit=ANY, context="inbox", name_filter="Jacki McMahan"
+        )
+        assert urls == ["https://www.linkedin.com/messaging/thread/2-aaa/"]
+
+    async def test_resolver_falls_back_to_search_when_inbox_empty(self, mock_page):
+        """When the inbox scan finds no match, resolution falls back to the
+        messaging search for threads buried below the inbox window."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        # First call (inbox) finds nothing; second call (search) finds the thread.
+        refs_mock = AsyncMock(
+            side_effect=[
+                [],
+                [
+                    {
+                        "kind": "conversation",
+                        "url": "/messaging/thread/2-ddd/",
+                        "text": "Jacki McMahan",
+                        "context": "search",
+                    },
+                ],
+            ]
+        )
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
             patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(extractor, "_extract_conversation_thread_refs", refs_mock),
+        ):
+            urls = await extractor._resolve_conversation_thread_urls("Jacki McMahan")
+
+        assert nav_mock.await_args_list[0].args == (
+            "https://www.linkedin.com/messaging/",
+        )
+        assert nav_mock.await_args_list[1].args == (
+            "https://www.linkedin.com/messaging/?searchTerm=Jacki+McMahan",
+        )
+        assert refs_mock.await_count == 2
+        assert urls == ["https://www.linkedin.com/messaging/thread/2-ddd/"]
+
+    async def test_extract_refs_threads_name_filter_into_evaluate(self, mock_page):
+        """_extract_conversation_thread_refs forwards name_filter into the
+        in-browser click loop so non-matching rows are never clicked."""
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.wait_for_selector = AsyncMock()
+        captured: dict[str, object] = {}
+
+        async def fake_evaluate(_js: str, arg: dict | None = None) -> list:
+            captured["arg"] = arg
+            return []
+
+        mock_page.evaluate = fake_evaluate
+
+        await extractor._extract_conversation_thread_refs(
+            limit=50, context="inbox", name_filter="Jacki McMahan"
+        )
+
+        assert captured["arg"] == {"limit": 50, "nameFilter": "Jacki McMahan"}
+
+
+class TestSearchConversations:
+    async def test_returns_search_results(self, mock_page):
+        """search_conversations returns search_results section."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(
                 extractor,
                 "_extract_root_content",
@@ -3295,20 +4743,43 @@ class TestSearchConversations:
                 "linkedin_mcp_server.scraping.extractor.build_references",
                 return_value=[],
             ),
+            patch.object(
+                extractor,
+                "_extract_conversation_thread_refs",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
         ):
-            result = await extractor.search_conversations("hello")
+            result = await extractor.search_conversations("hello world")
 
         assert "search_results" in result["sections"]
         assert "Result 1" in result["sections"]["search_results"]
+        # Search must be driven by the searchTerm URL parameter, not by typing
+        # into the searchbox -- the URL form is reliable across SPA mounts and
+        # preserves the search filter across click-to-capture navigations.
+        nav_mock.assert_awaited_once_with(
+            "https://www.linkedin.com/messaging/?searchTerm=hello+world"
+        )
 
-
-class TestSendMessage:
-    async def test_thread_id_path_skips_profile_lookup(self, mock_page):
-        """send_message with thread_id opens thread directly and skips profile lookup."""
+    async def test_includes_conversation_thread_refs(self, mock_page):
+        """search_conversations exposes per-result thread URLs as references."""
         extractor = LinkedInExtractor(mock_page)
-        nav_mock = AsyncMock()
+        thread_refs = [
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-abc/",
+                "text": "Jacki McMahan",
+                "context": "search_results",
+            },
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-def/",
+                "text": "Jacki McMahan",
+                "context": "search_results",
+            },
+        ]
         with (
-            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
             patch(
                 "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
                 new_callable=AsyncMock,
@@ -3317,49 +4788,40 @@ class TestSendMessage:
                 "linkedin_mcp_server.scraping.extractor.handle_modal_close",
                 new_callable=AsyncMock,
             ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(
                 extractor,
-                "_read_profile_display_name",
+                "_extract_root_content",
                 new_callable=AsyncMock,
-                return_value="Test User",
-            ) as read_name_mock,
-            patch.object(
-                extractor,
-                "_resolve_message_compose_href",
-                new_callable=AsyncMock,
-                return_value=None,
-            ) as resolve_href_mock,
-            patch.object(
-                extractor,
-                "_wait_for_message_surface",
-                new_callable=AsyncMock,
-                return_value="composer",
+                return_value={"text": "Jacki McMahan\nJacki McMahan", "references": []},
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
+                return_value="Jacki McMahan\nJacki McMahan",
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_references",
+                return_value=[],
             ),
             patch.object(
                 extractor,
-                "_resolve_message_compose_box",
+                "_extract_conversation_thread_refs",
                 new_callable=AsyncMock,
-                return_value=MagicMock(),
-            ),
-            patch.object(
-                extractor,
-                "_dismiss_message_ui",
-                new_callable=AsyncMock,
-            ),
+                return_value=thread_refs,
+            ) as mock_refs,
         ):
-            result = await extractor.send_message(
-                None,
-                "Hello!",
-                confirm_send=False,
-                thread_id="abc123",
-            )
+            result = await extractor.search_conversations("Jacki")
 
-        assert result["status"] == "confirmation_required"
-        first_nav_call = nav_mock.await_args_list[0].args[0]
-        assert first_nav_call == "https://www.linkedin.com/messaging/thread/abc123/"
-        read_name_mock.assert_not_awaited()
-        resolve_href_mock.assert_not_awaited()
+        mock_refs.assert_awaited_once_with(limit=20, context="search_results")
+        refs = result["references"]["search_results"]
+        assert len(refs) == 2
+        assert {ref["url"] for ref in refs} == {
+            "/messaging/thread/2-abc/",
+            "/messaging/thread/2-def/",
+        }
 
+
+class TestSendMessage:
     async def test_dry_run_returns_confirmation_required(self, mock_page):
         """send_message with confirm_send=False returns confirmation_required status."""
         extractor = LinkedInExtractor(mock_page)
@@ -3854,3 +5316,107 @@ class TestStarConversation:
 
         assert result["status"] == "already_starred"
         assert result["starred"] is True
+
+
+class TestBuildFeedReferences:
+    """Tests for _build_feed_references SDUI-capture / DOM-anchor merging."""
+
+    def test_sdui_urls_become_relative_feed_post_references(self):
+        captured = [
+            "https://www.linkedin.com/posts/alice_some-slug-ugcPost-1-xx",
+            "https://www.linkedin.com/posts/bob_other-post-share-2-yy",
+        ]
+        refs = _build_feed_references([], captured)
+        assert refs == [
+            {
+                "kind": "feed_post",
+                "url": "/posts/alice_some-slug-ugcPost-1-xx",
+                "context": "feed",
+            },
+            {
+                "kind": "feed_post",
+                "url": "/posts/bob_other-post-share-2-yy",
+                "context": "feed",
+            },
+        ]
+
+    def test_duplicate_sdui_urls_are_deduped(self):
+        captured = [
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+        ]
+        refs = _build_feed_references([], captured)
+        assert len(refs) == 1
+        assert refs[0]["url"] == "/posts/alice_x-ugcPost-1-xx"
+
+    def test_dom_anchor_feed_update_passes_through(self):
+        # DOM anchors that classify_link recognises as feed_post survive
+        # the merge alongside SDUI captures.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/feed/update/urn:li:activity:1234567890/",
+                "text": "View post",
+            }
+        ]
+        refs = _build_feed_references(raw_anchors, [])
+        assert any(
+            r["url"] == "/feed/update/urn:li:activity:1234567890/"
+            and r["kind"] == "feed_post"
+            for r in refs
+        )
+
+    def test_non_posts_paths_in_sdui_capture_are_skipped(self):
+        # Defensive: only /posts/<slug> shapes count for SDUI append.
+        captured = [
+            "https://www.linkedin.com/in/someuser/",
+            "https://www.linkedin.com/posts/alice_x-ugcPost-1-xx",
+        ]
+        refs = _build_feed_references([], captured)
+        assert [r["url"] for r in refs] == ["/posts/alice_x-ugcPost-1-xx"]
+
+    def test_cap_matches_num_posts_ceiling(self):
+        captured = [
+            f"https://www.linkedin.com/posts/p{i}-ugcPost-{i}-xx" for i in range(60)
+        ]
+        refs = _build_feed_references([], captured)
+        # Cap is 50, mirroring _REFERENCE_CAPS["feed"] / num_posts <= 50.
+        assert len(refs) == 50
+
+    def test_non_feed_post_dom_anchors_are_filtered(self):
+        # Sidebar profile / company / external anchors must not crowd
+        # out SDUI permalinks — references["feed"] is feed_post-only.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/in/sidebar-user/",
+                "text": "Sidebar User",
+            },
+            {
+                "href": "https://www.linkedin.com/company/some-corp/",
+                "text": "Some Corp",
+            },
+            {
+                "href": "https://example.com/external/",
+                "text": "External Link",
+            },
+        ]
+        refs = _build_feed_references(raw_anchors, [])
+        assert refs == []
+
+    def test_feed_post_dom_anchors_coexist_with_sdui_captures(self):
+        # The two sources fold into the same feed_post kind without
+        # collapsing across URL shapes pointing at the same post.
+        raw_anchors = [
+            {
+                "href": "https://www.linkedin.com/feed/update/urn:li:activity:111/",
+                "text": "View post",
+            }
+        ]
+        captured = ["https://www.linkedin.com/posts/alice_x-ugcPost-1-xx"]
+        refs = _build_feed_references(raw_anchors, captured)
+        urls = [r["url"] for r in refs]
+        kinds = {r["kind"] for r in refs}
+        assert urls == [
+            "/feed/update/urn:li:activity:111/",
+            "/posts/alice_x-ugcPost-1-xx",
+        ]
+        assert kinds == {"feed_post"}

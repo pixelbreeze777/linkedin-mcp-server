@@ -1,27 +1,33 @@
-# LinkedIn MCP Server
+# MCP Server for LinkedIn
 
 A Model Context Protocol (MCP) server that connects AI assistants to LinkedIn. Access profiles, companies, and job postings through a Docker container.
+
+> **Disclaimer:** This is an independent, community project. It is not affiliated with, authorized by, endorsed by, or sponsored by LinkedIn Corporation or Microsoft. "LinkedIn" is a registered trademark of LinkedIn Corporation and is used here only descriptively to identify the third-party service this software interoperates with.
 
 ## Features
 
 - **Profile Access**: Get detailed LinkedIn profile information including experience, education, skills, projects, certifications, and more
+- **Own Profile**: Fetch the authenticated user's own profile to give agents self-context
 - **Profile Connections**: Send connection requests or accept incoming ones, with optional notes
-- **Company Profiles**: Extract comprehensive company data
+- **Company Profiles**: Extract comprehensive company data, including the LinkedIn company URN id (used by LinkedIn's people-search `currentCompany` URL facet)
+- **Company Employees**: List employees at a company with optional keyword filtering
+- **Company Search**: Search for companies by keyword
 - **Job Details**: Retrieve job posting information
 - **Job Search**: Search for jobs with keywords and location filters
 - **People Search**: Search for people by keywords and location
 - **Person Posts**: Get recent activity/posts from a person's profile
 - **Company Posts**: Get recent posts from a company's LinkedIn feed
+- **Home Feed**: Get recent posts from the authenticated user's LinkedIn home feed
 - **Compact References**: Return typed per-section links alongside readable text without shipping full-page markdown
 
 ## Quick Start
 
-Create a browser profile locally, then mount it into Docker. You still need [uv](https://docs.astral.sh/uv/getting-started/installation/) installed on the host for the one-time `uvx linkedin-scraper-mcp@latest --login` step. Docker already includes its own Chromium runtime, so the managed Patchright Chromium browser download used by MCPB/`uvx` is not needed here.
+Create a browser profile locally, then mount it into Docker. You still need [uv](https://docs.astral.sh/uv/getting-started/installation/) installed on the host for the one-time `uvx mcp-server-linkedin@latest --login` step. Docker already includes its own Chromium runtime, so the managed Patchright Chromium browser download used by MCPB/`uvx` is not needed here.
 
 **Step 1: Create profile on the host (one-time setup)**
 
 ```bash
-uvx linkedin-scraper-mcp@latest --login
+uvx mcp-server-linkedin@latest --login
 ```
 
 This opens a browser window where you log in manually (5 minute timeout for 2FA, captcha, etc.). The browser profile and cookies are saved under `~/.linkedin-mcp/`. On startup, Docker derives a Linux browser profile from your host cookies and creates a fresh session each time. For better stability, consider the [uvx setup](https://github.com/stickerdaniel/linkedin-mcp-server#-uvx-setup-recommended---universal).
@@ -58,6 +64,7 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 | `USER_DATA_DIR` | `~/.linkedin-mcp/profile` | Path to persistent browser profile directory |
 | `LOG_LEVEL` | `WARNING` | Logging level: DEBUG, INFO, WARNING, ERROR |
 | `TIMEOUT` | `5000` | Browser timeout in milliseconds |
+| `TOOL_TIMEOUT` | `180` | Per-tool MCP execution timeout in seconds. Increase further for heavy scrapes (multi-section profiles, cold-start Chromium, slow networks/containers). |
 | `USER_AGENT` | - | Custom browser user agent |
 | `TRANSPORT` | `stdio` | Transport mode: stdio, streamable-http |
 | `HOST` | `127.0.0.1` | HTTP server host (for streamable-http transport) |
@@ -69,7 +76,7 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 | `LINKEDIN_EXPERIMENTAL_PERSIST_DERIVED_SESSION` | `false` | Experimental: reuse checkpointed derived Linux runtime profiles across Docker restarts instead of fresh-bridging each startup |
 | `LINKEDIN_TRACE_MODE` | `on_error` | Trace/log retention mode: `on_error` keeps ephemeral artifacts only when a failure occurs, `always` keeps every run, `off` disables trace persistence |
 
-**Example with custom timeout:**
+**Example with custom timeouts:**
 
 ```json
 {
@@ -80,6 +87,7 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
         "run", "-i", "--rm",
         "-v", "~/.linkedin-mcp:/home/pwuser/.linkedin-mcp",
         "-e", "TIMEOUT=10000",
+        "-e", "TOOL_TIMEOUT=300",
         "stickerdaniel/linkedin-mcp-server"
       ]
     }

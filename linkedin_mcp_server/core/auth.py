@@ -33,33 +33,6 @@ _REMEMBER_ME_CONTAINER_SELECTOR = "#rememberme-div"
 _REMEMBER_ME_BUTTON_SELECTOR = "#rememberme-div button"
 
 
-async def warm_up_browser(page: Page) -> None:
-    """Visit normal sites to appear more human-like before LinkedIn access."""
-    sites = [
-        "https://www.google.com",
-        "https://www.wikipedia.org",
-        "https://www.github.com",
-    ]
-
-    logger.info("Warming up browser by visiting normal sites...")
-
-    failures = 0
-    for site in sites:
-        try:
-            await page.goto(site, wait_until="domcontentloaded", timeout=10000)
-            await asyncio.sleep(1)
-            logger.debug("Visited %s", site)
-        except Exception as e:
-            failures += 1
-            logger.debug("Could not visit %s: %s", site, e)
-            continue
-
-    if failures == len(sites):
-        logger.warning("Browser warm-up failed: none of %d sites reachable", len(sites))
-    else:
-        logger.info("Browser warm-up complete")
-
-
 async def is_logged_in(page: Page) -> bool:
     """Check if currently logged in to LinkedIn.
 

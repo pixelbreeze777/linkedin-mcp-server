@@ -584,7 +584,7 @@ def _move_invalid_auth_state_aside() -> None:
 
 async def _run_login_flow() -> None:
     _state.auth_state = AuthState.IN_PROGRESS
-    success = await interactive_login(get_profile_dir(), warm_up=True)
+    success = await interactive_login(get_profile_dir())
     if not success:
         raise AuthenticationBootstrapFailedError(
             "LinkedIn login was not completed. Retry the tool call to reopen the browser and continue setup."

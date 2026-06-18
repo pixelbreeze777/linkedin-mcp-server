@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Tests: `uv run pytest` (with coverage: `uv run pytest --cov`)
 - Pre-commit: `uv run pre-commit install` then `uv run pre-commit run --all-files`
 - Run server locally: `uv run -m linkedin_mcp_server --no-headless`
-- Run via uvx (PyPI/package verification only): `uvx linkedin-scraper-mcp`
+- Run via uvx (PyPI/package verification only): `uvx mcp-server-linkedin`
 - Docker build: `docker build -t linkedin-mcp-server .`
 - Install browser: `uv run patchright install chromium`
 
@@ -19,6 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **One section = one navigation.** Each entry in `PERSON_SECTIONS` / `COMPANY_SECTIONS` (`scraping/fields.py`) maps to exactly one page navigation. Never combine multiple URLs behind a single section.
 - **Minimize DOM dependence.** Prefer innerText and URL navigation over DOM selectors. When DOM access is unavoidable, use minimal generic selectors (`a[href*="/jobs/view/"]`) — never class names tied to LinkedIn's layout.
+- **Detection must be locale-independent.** Classification logic — connection state, action availability, button identity — must rely on URL patterns (`/preload/custom-invite/?vanityName=USER`, `/in/USER/edit/intro/`, `/messaging/compose/`), attribute *presence* (`aria-label` exists, `aria-expanded` exists, `aria-disabled` exists), or structural counts — never on text values like "Connect", "Follow", "Message", "1st", "Pending". The verb in an `aria-label` is locale-dependent; whether the attribute exists is not. Where text is genuinely the only signal, guard it behind an explicit per-locale table and document the limitation in code.
 
 ## Tool Return Format
 
@@ -26,10 +27,11 @@ All scraping tools return: `{url, sections: {name: raw_text}}`.
 
 Optional additional keys:
 
-- `references: {section_name: [{kind, url, text?, context?}]}` — LinkedIn URLs are relative paths
+- `references: {section_name: [{kind, url, text?, context?, value?}]}` — LinkedIn URLs are relative paths; `value` carries non-URL identifiers (e.g. company URN id for `kind: "company_urn"`)
 - `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs only)
+- `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 
 ## Verifying Bug Reports
 
@@ -107,10 +109,6 @@ gh api repos/{owner}/{repo}/issues/{pr}/comments   # follow-up reviews
 
 ## btca
 
-When you need up-to-date information about technologies used in this project, use btca to query source repositories directly.
+When you need up-to-date information about technologies used in this project, use the `btca-local` skill to search the actual source repos. `btca.config.jsonc` is the resource registry; every resource is pre-cloned at `~/.btca/agent/sandbox/<resourceName>` (e.g. `fastmcp`, `playwrightPython`). "Use btca with `<resource>` resource" means: search that clone. If a resource is missing from the sandbox, clone it with the url and branch from the manifest (the skill's "clone main by default" does not apply to registered resources).
 
-```bash
-btca resources                           # list available resources
-btca ask -r <resource> -q "<question>"
-btca ask -r fastmcp -r playwright -q "How do I set up browser context with FastMCP tools?"
-```
+**New dependencies:** When adding a new dependency, always add its repo to `btca.config.jsonc` (verify the default branch first: `gh api repos/OWNER/REPO --jq '.default_branch'`) and clone it into the sandbox. Resource names are shared across projects in the sandbox, so pick a name that identifies the repo unambiguously (`playwrightPython`, not `playwright`).

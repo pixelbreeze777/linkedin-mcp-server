@@ -22,7 +22,7 @@ The scraping engine is built around a **one-section-one-navigation** design. Und
 
 ### Why This Design?
 
-AI assistants (LLMs) call our MCP tools. Each LinkedIn page navigation takes time and risks rate limits. By mapping each section to exactly one URL, the LLM can request only the sections it needs — skipping unnecessary navigations while still capturing all available info from each visited page via `innerText` extraction.
+AI assistants (LLMs) call our MCP tools. Each LinkedIn page navigation takes time. By mapping each section to exactly one URL, the LLM can request only the sections it needs — skipping unnecessary navigations while still capturing all available info from each visited page via `innerText` extraction.
 
 ### How It Works
 
@@ -55,7 +55,7 @@ for section_name, (suffix, is_overlay) in PERSON_SECTIONS.items():
 ```python
 {"url": str, "sections": {name: raw_text}}
 # Optional compact link metadata:
-{"url": str, "sections": {name: raw_text}, "references": {section: [{kind, url, text?, context?}, ...]}}
+{"url": str, "sections": {name: raw_text}, "references": {section: [{kind, url, text?, context?, value?}, ...]}}
 # When unknown section names are provided:
 {"url": str, "sections": {name: raw_text}, "unknown_sections": [name, ...]}
 # search_jobs also returns:

@@ -236,7 +236,11 @@ def get_version() -> str:
     try:
         from importlib.metadata import PackageNotFoundError, version
 
-        for package_name in ("linkedin-scraper-mcp", "linkedin-mcp-server"):
+        for package_name in (
+            "mcp-server-linkedin",
+            "linkedin-scraper-mcp",
+            "linkedin-mcp-server",
+        ):
             try:
                 return version(package_name)
             except PackageNotFoundError:
@@ -312,7 +316,7 @@ def main() -> None:
                 transport = choose_transport_interactive()
 
             # Create and run the MCP server
-            mcp = create_mcp_server()
+            mcp = create_mcp_server(tool_timeout=config.server.tool_timeout_seconds)
 
             if transport == "streamable-http":
                 mcp.run(

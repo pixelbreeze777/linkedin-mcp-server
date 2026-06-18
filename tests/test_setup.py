@@ -43,7 +43,6 @@ def _patch_login_deps(
         "linkedin_mcp_server.setup.get_config", lambda: config or AppConfig()
     )
     monkeypatch.setattr("linkedin_mcp_server.setup.BrowserManager", browser_factory)
-    monkeypatch.setattr("linkedin_mcp_server.setup.warm_up_browser", AsyncMock())
     monkeypatch.setattr(
         "linkedin_mcp_server.setup.resolve_remember_me_prompt",
         AsyncMock(return_value=False),

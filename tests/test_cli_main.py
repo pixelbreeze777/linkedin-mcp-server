@@ -43,7 +43,9 @@ def test_main_non_interactive_stdio_has_no_human_stdout(
     )
     _patch_main_dependencies(monkeypatch, config)
     mcp = MagicMock()
-    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", lambda: mcp)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
 
     cli_main.main()
 
@@ -64,7 +66,9 @@ def test_main_interactive_prompts_when_transport_not_explicit(
         "linkedin_mcp_server.cli_main.choose_transport_interactive", choose_transport
     )
     mcp = MagicMock()
-    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", lambda: mcp)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
 
     cli_main.main()
 
@@ -91,7 +95,9 @@ def test_main_explicit_transport_skips_prompt(
         "linkedin_mcp_server.cli_main.choose_transport_interactive", choose_transport
     )
     mcp = MagicMock()
-    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", lambda: mcp)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
 
     cli_main.main()
 
@@ -114,7 +120,9 @@ def test_main_streamable_http_passes_host_port_path(
     config.server.path = "/custom-mcp"
     _patch_main_dependencies(monkeypatch, config)
     mcp = MagicMock()
-    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", lambda: mcp)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
 
     cli_main.main()
 
@@ -128,6 +136,29 @@ def test_main_streamable_http_passes_host_port_path(
     assert captured.out == ""
 
 
+def test_main_passes_configured_tool_timeout_to_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(
+        is_interactive=False, transport="stdio", transport_explicitly_set=False
+    )
+    config.server.tool_timeout_seconds = 42.0
+    _patch_main_dependencies(monkeypatch, config)
+
+    captured: dict[str, float] = {}
+
+    def fake_create(**kwargs: float) -> MagicMock:
+        captured.update(kwargs)
+        mcp = MagicMock()
+        return mcp
+
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", fake_create)
+
+    cli_main.main()
+
+    assert captured["tool_timeout"] == 42.0
+
+
 def test_get_version_prefers_installed_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -135,14 +166,14 @@ def test_get_version_prefers_installed_metadata(
 
     def fake_version(package_name: str) -> str:
         calls.append(package_name)
-        if package_name == "linkedin-scraper-mcp":
+        if package_name == "mcp-server-linkedin":
             return "4.2.0"
         raise importlib.metadata.PackageNotFoundError(package_name)
 
     monkeypatch.setattr(importlib.metadata, "version", fake_version)
 
     assert cli_main.get_version() == "4.2.0"
-    assert calls == ["linkedin-scraper-mcp"]
+    assert calls == ["mcp-server-linkedin"]
 
 
 def test_main_non_interactive_no_auth_still_starts_server(
@@ -153,7 +184,9 @@ def test_main_non_interactive_no_auth_still_starts_server(
     )
     _patch_main_dependencies(monkeypatch, config)
     mcp = MagicMock()
-    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", lambda: mcp)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
 
     cli_main.main()
 
